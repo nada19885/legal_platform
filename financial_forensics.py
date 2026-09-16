@@ -1,0 +1,241 @@
+"""
+Claim-Based Financial Forensics Synthesis
+Location: lib/python/legal_platform/financial_forensics.py
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from typing import Any
+
+import dataiku
+import pandas as pd
+
+from .config import (
+    FINANCIAL_FINDINGS_DATASET,
+    FINANCIAL_TIMELINE_DATASET,
+    FINANCIAL_LINE_ITEMS_DATASET,
+)
+
+from .storage import case_rows
+from .financial_corrections import load_latest_corrections
+from .financial_normalizer import normalize_row_for_ledger
+from .ids import random_id
+from .llm import parse_json_object, strip_think
+
+try:
+    from .config import GENERATION_LLM_ID as TEXT_MODEL_ENDPOINT
+except ImportError:
+    TEXT_MODEL_ENDPOINT = "openai:Nutamix_GPU:qwen3-32b"
+
+logger = logging.getLogger("FinancialForensics")
+
+# -----------------------------------------------------------------------------
+# PROMPTS
+# -----------------------------------------------------------------------------
+CLAIM_BASED_ACCOUNTING_PROMPT = r"""
+You are a senior forensic accountant representing Banque Saudi Fransi (BSF).
+Evaluate each customer claim against the available financial records. 
+
+INPUTS:
+- Customer Claims: {claims_json}
+- Financial Evidence (Normalized Ledger): {ledger_json}
+- User Analysis Instructions: {instructions}
+
+METHODOLOGY:
+1. Understand the claim to determine the exact financial question.
+2. Determine what financial evidence would normally be expected.
+3. Identify the relevant financial evidence from the provided ledger.
+4. Compare the claim against the evidence.
+5. Apply any provided user instructions strictly as methodological guidance.
+
+RULES:
+- Use ONLY the provided claims and ledger.
+- Never invent transactions, amounts, dates, or references.
+- Do not make legal conclusions (e.g., liability, regulatory violations).
+- State limitations if the ledger cannot fully answer the allegation (e.g., authorization).
+- Result must be one of: SUPPORTED, PARTIALLY_SUPPORTED, CONTRADICTED, NOT_VERIFIABLE, NO_FINANCIAL_EVIDENCE, NOT_FINANCIAL_CLAIM.
+
+RETURN JSON ONLY:
+{
+  "claim_evaluations": [
+    {
+      "claim_id": "CLM_001",
+      "claim": "...",
+      "financial_question": "...",
+      "expected_evidence": "...",
+      "financial_evidence_found": [
+        {
+          "record_id": "...",
+          "date": "...",
+          "type": "...",
+          "amount": 0.0,
+          "reference": "..."
+        }
+      ],
+      "comparison": "...",
+      "result": "SUPPORTED",
+      "accounting_response": "...",
+      "limitation": "...",
+      "evidence_record_ids": ["..."]
+    }
+  ]
+}
+""".strip()
+
+
+# -----------------------------------------------------------------------------
+# PARSING & UTILITIES
+# -----------------------------------------------------------------------------
+def _call_text_llm(prompt: str) -> dict:
+    """Executes completion on Dataiku LLM endpoint with robust JSON parsing."""
+    project = dataiku.api_client().get_default_project()
+    llm = project.get_llm(TEXT_MODEL_ENDPOINT)
+    completion = llm.new_completion()
+    try:
+        completion.settings["temperature"] = 0.0
+    except Exception:
+        pass
+    completion.with_message(prompt, role="user")
+    response = completion.execute()
+
+    if getattr(response, "success", None) is False:
+        raise RuntimeError(str(getattr(response, "error_message", "LLM request failed.")))
+
+    text = getattr(response, "text", "") or ""
+    return parse_json_object(strip_think(text))
+
+
+# -----------------------------------------------------------------------------
+# TIMELINE BUILDER & LEDGER PREP
+# -----------------------------------------------------------------------------
+def build_full_normalized_ledger(case_id: str) -> list[dict]:
+    """Rebuilds the COMPLETE normalized ledger for a case applying the latest human corrections."""
+    rows_df = case_rows(FINANCIAL_LINE_ITEMS_DATASET, case_id)
+    if rows_df.empty:
+        return []
+
+    corrections = load_latest_corrections(case_id)
+    rows = rows_df.to_dict(orient="records")
+    return [normalize_row_for_ledger(row, corrections) for row in rows]
+
+
+def build_and_save_financial_timeline(case_id: str, normalized_ledger: list[dict]) -> pd.DataFrame:
+    """Persists all sorted chronological transactions to the financial timeline dataset."""
+    if not normalized_ledger:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(normalized_ledger)
+    if "date" in df.columns:
+        df = df.sort_values(by="date", ascending=True)
+
+    df["case_id"] = str(case_id)
+    df["timeline_id"] = [random_id("TIMELINE") for _ in range(len(df))]
+
+    try:
+        ds = dataiku.Dataset(FINANCIAL_TIMELINE_DATASET)
+        try:
+            ex = ds.get_dataframe()
+            if not ex.empty and "case_id" in ex.columns:
+                ex = ex[ex["case_id"].astype(str) != str(case_id)].copy()
+                final_df = pd.concat([ex, df], ignore_index=True)
+            else:
+                final_df = df
+        except Exception:
+            final_df = df
+        ds.write_with_schema(final_df)
+        logger.info(f"Persisted {len(df)} transactions to {FINANCIAL_TIMELINE_DATASET}")
+    except Exception as e:
+        logger.warning(f"Could not persist timeline dataset: {e}")
+
+    return df
+
+
+# -----------------------------------------------------------------------------
+# CLAIM-BASED SYNTHESIS
+# -----------------------------------------------------------------------------
+def run_claim_based_accounting_analysis(case_id: str, normalized_ledger: list[dict], customer_claims: list[dict], instructions: str = "") -> dict:
+    if not normalized_ledger:
+        raise ValueError("No normalized transactions available for forensic analysis.")
+    if not customer_claims:
+        return {"claim_evaluations": []}
+
+    # Format the ledger to preserve token context
+    compact_ledger = [
+        {
+            "record_id": r.get("row_id"),
+            "date": r.get("date"),
+            "type": r.get("debit_or_credit"),
+            "amount": r.get("amount"),
+            "description": str(r.get("description", ""))[:50]
+        }
+        for r in normalized_ledger
+    ]
+
+    prompt = CLAIM_BASED_ACCOUNTING_PROMPT.replace("{claims_json}", json.dumps(customer_claims, ensure_ascii=False)) \
+                                          .replace("{ledger_json}", json.dumps(compact_ledger, ensure_ascii=False)) \
+                                          .replace("{instructions}", instructions or "None provided.")
+
+    try:
+        print("[forensic synthesis] Evaluating customer claims against financial ledger...", flush=True)
+        findings_result = _call_text_llm(prompt)
+    except Exception as err:
+        logger.warning(f"Accounting analysis failed: {err!r}")
+        findings_result = {"claim_evaluations": []}
+
+    _persist_claim_results(case_id, findings_result)
+    return findings_result
+
+
+def _persist_claim_results(case_id: str, results: dict):
+    row = {
+        "finding_id": random_id("FIND"),
+        "case_id": str(case_id),
+        "accounting_findings_json": json.dumps(results, ensure_ascii=False),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    ds = dataiku.Dataset(FINANCIAL_FINDINGS_DATASET)
+    try:
+        ex_f = ds.get_dataframe()
+        if not ex_f.empty and "case_id" in ex_f.columns:
+            ex_f = ex_f[ex_f["case_id"].astype(str) != str(case_id)].copy()
+            final_f = pd.concat([ex_f, pd.DataFrame([row])], ignore_index=True)
+        else:
+            final_f = pd.DataFrame([row])
+        ds.write_with_schema(final_f)
+    except Exception as e:
+        logger.warning(f"Could not persist findings dataset: {e}")
+
+
+def load_saved_forensic_results(case_id: str) -> dict:
+    """Reads back persisted timeline and new claim findings for the case."""
+    out = {
+        "timeline": [],
+        "claim_evaluations": [],
+    }
+    try:
+        ds_t = dataiku.Dataset(FINANCIAL_TIMELINE_DATASET)
+        df_t = ds_t.get_dataframe()
+        if not df_t.empty and "case_id" in df_t.columns:
+            out["timeline"] = df_t[df_t["case_id"].astype(str) == str(case_id)].to_dict(orient="records")
+    except Exception:
+        pass
+
+    try:
+        ds_f = dataiku.Dataset(FINANCIAL_FINDINGS_DATASET)
+        df_f = ds_f.get_dataframe()
+        if not df_f.empty and "case_id" in df_f.columns:
+            matches = df_f[df_f["case_id"].astype(str) == str(case_id)]
+            if not matches.empty:
+                latest = matches.iloc[-1].to_dict()
+                parsed_findings = json.loads(latest.get("accounting_findings_json", "{}") or "{}")
+                out["claim_evaluations"] = parsed_findings.get("claim_evaluations", [])
+    except Exception:
+        pass
+
+    return out
+
+
