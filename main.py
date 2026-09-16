@@ -863,13 +863,18 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 JOB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="legal-platform-job")
 
+# Fixed sentinel "case" the canary writes to/reads back from. Kept separate
+# from any real case_id so the check needs no extra plumbing through the
+# job call sites and never pollutes a real case's audit trail.
+_JOB_CANARY_ID = "__job_canary__"
 
-def _dataiku_write_canary(case_id):
+
+def _dataiku_write_canary():
     """Prove this worker thread can write to and read back from Dataiku
     before running an expensive pipeline on it. Raises loudly instead of
     letting a real result be computed and then silently lost."""
-    marker_id = audit(case_id, "job_canary", case_id, "canary_write", actor="system")
-    rows = case_rows("audit_events", case_id)
+    marker_id = audit(_JOB_CANARY_ID, "job_canary", _JOB_CANARY_ID, "canary_write", actor="system")
+    rows = case_rows("audit_events", _JOB_CANARY_ID)
     ids = set(rows["audit_event_id"].astype(str)) if not rows.empty and "audit_event_id" in rows.columns else set()
     if marker_id not in ids:
         raise RuntimeError(
@@ -929,7 +934,7 @@ def _run_job(job_id, target, session_id=None):
         _finish_job(job_id, error=f"{type(error).__name__}: {error}")
 
 ### Youssif added session_id here ###
-def _run_async(job_id, target, case_id=None, session_id=None):
+def _run_async(job_id, target, session_id=None):
     """Background by default; RUN_JOBS_INLINE=True is the emergency
     fallback to the old synchronous behaviour."""
     if RUN_JOBS_INLINE:
@@ -938,13 +943,12 @@ def _run_async(job_id, target, case_id=None, session_id=None):
         return
 
     def guarded():
-        if case_id:
-            try:
-                _dataiku_write_canary(case_id)
-            except Exception as error:
-                traceback.print_exc()
-                _finish_job(job_id, error=f"{type(error).__name__}: {error}")
-                return
+        try:
+            _dataiku_write_canary()
+        except Exception as error:
+            traceback.print_exc()
+            _finish_job(job_id, error=f"{type(error).__name__}: {error}")
+            return
         ### Youssif added session_id here ###
         _run_job(job_id, target, session_id=session_id)
 
@@ -1214,7 +1218,7 @@ def documents_process():
             **totals,
         }
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1317,7 +1321,7 @@ def accounting_classify_documents():
         ### END ###
         return {"classified_documents": len(doc_ids)}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1376,7 +1380,7 @@ def accounting_extract():
         rows_persisted = result.get("rows_persisted", 0) if isinstance(result, dict) else 0
         return {"rows_persisted": rows_persisted}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1427,7 +1431,7 @@ def accounting_synthesize():
             "findings": refreshed.get("forensic_findings") or {},
         }
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1463,7 +1467,7 @@ def summary_prepare():
         persist_workflow_state(state, load_case_data(case_id), case_id, action="summary_prepared")
         return {"attorney_summary": summary, "summary_support": serialise_summary_support(summary, data)}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1514,7 +1518,7 @@ def analysis_run():
         persist_workflow_state(state, load_case_data(case_id), case_id, action="analysis_prepared")
         return {"research": state["research"], "analysis": state["analysis"]}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1545,7 +1549,7 @@ def analysis_defence_plan():
         persist_workflow_state(state, load_case_data(case_id), case_id, action="defence_plan_prepared")
         return {"strategy": strategy}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1586,7 +1590,7 @@ def pleading_generate():
         persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_prepared")
         return {"memo": memo, "pleading_versions": state["pleading_versions"], "pleading_status": "draft"}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1629,7 +1633,7 @@ def pleading_revise():
             "version": version_no,
         }
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1742,7 +1746,7 @@ def discussion_ask():
             )
         return {"answer": answer, "invalidated": add_to_record}
 
-    _run_async(job_id, task, case_id=case_id)
+    _run_async(job_id, task)
     return jsonify({"job_id": job_id})
 
 
@@ -1841,7 +1845,7 @@ def agreement_process():
         ### END ###
         return {"processed": processed}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1866,7 +1870,7 @@ def agreement_classify():
         return {"classification": result}
 
     ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1922,7 +1926,7 @@ def agreement_extract_clauses():
         save_agreement_state(case_id, "clause_map", clause_map)
         return {"clause_map": clause_map}
     ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1957,7 +1961,7 @@ def agreement_run_review():
         save_agreement_state(case_id, "review", review)
         return {"review": review, "authorities": authorities_payload}
     ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1987,7 +1991,7 @@ def agreement_discuss():
         ### END ###
         return {"answer": answer}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
