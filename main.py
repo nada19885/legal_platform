@@ -62,12 +62,25 @@ from legal_platform.agreement_workbench import (
 # functions; only the calling convention (Flask route + job) differs.
 # ------------------------------------------------------------
 from legal_platform.config import (
+    APPROVALS_DATASET,
+    AUDIT_DATASET,
+    CASE_DOCUMENT_FOLDER_ID,
+    CASE_DOCUMENT_PAGES_DATASET,
+    CASE_DOCUMENTS_DATASET,
+    CASE_EVENTS_DATASET,
+    CASE_MESSAGES_DATASET,
+    CASE_PARTIES_DATASET,
+    EVIDENCE_DATASET,
+    FACT_CANDIDATES_DATASET,
+    FACTS_DATASET,
     FINANCIAL_DISCREPANCIES_DATASET,
     FINANCIAL_DOCUMENT_CLASSIFICATION_DATASET,
     FINANCIAL_FINDINGS_DATASET,
     FINANCIAL_LINE_ITEM_CORRECTIONS_DATASET,
     FINANCIAL_LINE_ITEMS_DATASET,
     FINANCIAL_TIMELINE_DATASET,
+    ISSUE_CANDIDATES_DATASET,
+    ISSUES_DATASET,
 )
 from legal_platform.financial_classification import classify_case_documents
 from legal_platform.financial_corrections import (
@@ -212,18 +225,18 @@ def _serialise_conflicts(case_id):
 def load_case_data(case_id):
     data = {
         "case": latest_case(case_id) or {"case_id": case_id},
-        "messages": case_rows("case_messages", case_id),
-        "documents": case_rows("case_documents", case_id),
-        "pages": case_rows("case_document_pages", case_id),
-        "facts": case_rows("case_facts", case_id),
-        "fact_candidates": case_rows("case_fact_candidates", case_id),
-        "parties": case_rows("case_parties", case_id),
-        "events": case_rows("case_events", case_id),
-        "issues": case_rows("case_issues", case_id),
-        "issue_candidates": case_rows("case_issue_candidates", case_id),
-        "evidence": case_rows("case_evidence", case_id),
-        "approvals": case_rows("case_approvals", case_id),
-        "audit_events": case_rows("audit_events", case_id),
+        "messages": case_rows(CASE_MESSAGES_DATASET, case_id),
+        "documents": case_rows(CASE_DOCUMENTS_DATASET, case_id),
+        "pages": case_rows(CASE_DOCUMENT_PAGES_DATASET, case_id),
+        "facts": case_rows(FACTS_DATASET, case_id),
+        "fact_candidates": case_rows(FACT_CANDIDATES_DATASET, case_id),
+        "parties": case_rows(CASE_PARTIES_DATASET, case_id),
+        "events": case_rows(CASE_EVENTS_DATASET, case_id),
+        "issues": case_rows(ISSUES_DATASET, case_id),
+        "issue_candidates": case_rows(ISSUE_CANDIDATES_DATASET, case_id),
+        "evidence": case_rows(EVIDENCE_DATASET, case_id),
+        "approvals": case_rows(APPROVALS_DATASET, case_id),
+        "audit_events": case_rows(AUDIT_DATASET, case_id),
         "financial_line_items": case_rows(FINANCIAL_LINE_ITEMS_DATASET, case_id),
     }
     forensic = load_saved_forensic_results(case_id)
@@ -725,7 +738,6 @@ def _load_page_image_bytes(page_image_path):
         return None
     try:
         import dataiku
-        from legal_platform.config import CASE_DOCUMENT_FOLDER_ID
         folder = dataiku.Folder(CASE_DOCUMENT_FOLDER_ID)
         with folder.get_download_stream(page_image_path) as stream:
             return stream.read()
@@ -874,7 +886,7 @@ def _dataiku_write_canary():
     before running an expensive pipeline on it. Raises loudly instead of
     letting a real result be computed and then silently lost."""
     marker_id = audit(_JOB_CANARY_ID, "job_canary", _JOB_CANARY_ID, "canary_write", actor="system")
-    rows = case_rows("audit_events", _JOB_CANARY_ID)
+    rows = case_rows(AUDIT_DATASET, _JOB_CANARY_ID)
     ids = set(rows["audit_event_id"].astype(str)) if not rows.empty and "audit_event_id" in rows.columns else set()
     if marker_id not in ids:
         raise RuntimeError(
