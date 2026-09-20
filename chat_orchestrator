@@ -13,7 +13,7 @@ from .review_pipeline import assess_case_completeness_multi_request
 from .research_package import research_approved_issues
 from .case_analysis import analyse_case
 from .strategy import generate_defence_strategy
-from .financial_classification import classify_case_pages
+from .financial_classification import classify_case_pages, classify_case_documents
 from .config import (
     COMPLETENESS_MAX_PAGE_SUMMARIES,
     COMPLETENESS_MAX_LATEST_PAGE_SUMMARIES,

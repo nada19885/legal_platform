@@ -174,7 +174,37 @@ def classify_case_pages(case_id: str, page_ids: list[str], actor: str = "", forc
         except Exception:
             pass # Dataset was empty or didn't exist yet
         ds.write_with_schema(df) # Automatically updates schema with our new columns!
-        
+
     return results
+
+
+# ============================================================
+# CLASSIFY BY DOCUMENT (resolves to page classification for now)
+# ============================================================
+
+def classify_case_documents(
+    case_id: str,
+    case_document_ids: list[str],
+    actor: str = "",
+    force_rerun: bool = False,
+) -> list[dict]:
+    """Classifies every page belonging to the given documents.
+
+    There is no document-level classifier yet — this resolves each
+    document to its pages and runs the existing page classifier over them.
+    """
+    if not case_document_ids:
+        return []
+
+    pages_df = case_rows("case_document_pages", case_id)
+    if pages_df is None or pages_df.empty:
+        return []
+
+    id_col = "case_document_page_id" if "case_document_page_id" in pages_df.columns else "page_id"
+    wanted_documents = {str(d) for d in case_document_ids}
+    matching_pages = pages_df[pages_df["case_document_id"].astype(str).isin(wanted_documents)]
+    page_ids = matching_pages[id_col].astype(str).tolist()
+
+    return classify_case_pages(case_id, page_ids, actor=actor, force_rerun=force_rerun)
 
 
