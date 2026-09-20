@@ -58,14 +58,6 @@ def load_financial_pages(
     return sources
 
 
-def load_page_image_bytes(page: FinancialPageSource) -> bytes:
-    if not page.page_image_path:
-        raise ValueError(f"Page {page.page_id} has no stored image path.")
-    folder = dataiku.Folder(CASE_DOCUMENT_FOLDER_ID)
-    with folder.get_download_stream(page.page_image_path) as stream:
-        return stream.read()
-
-
 def load_document_pdf_bytes(case_id: str, case_document_id: str) -> Optional[bytes]:
     """Best-effort fetch of the original uploaded PDF, used only for the
     optional native-table corroboration pass. Returns None (not an error) if

@@ -3,8 +3,12 @@
 Financial Evidence-Extraction Pipeline Orchestrator.
 Location: lib/python/legal_platform/financial_extraction_pipeline.py
 
-Per page: Stage 1a (PyMuPDF structural evidence) + Stage 1b (single VLM
-visual evidence) -> Stage 2 (text-LLM reconstruction into rows).
+Per page: Stage 1a (PyMuPDF structural evidence, from the original PDF) +
+the page's existing verbatim OCR transcription (produced once at document
+intake, see extraction.py/vlm_adapter.py) -> Stage 2 (text-LLM
+reconstruction into rows). No dedicated financial VLM pass: the intake OCR
+already transcribes every page verbatim, including tables, at the same DPI
+a financial-specific re-read would use.
 """
 
 from __future__ import annotations
@@ -17,12 +21,10 @@ from .storage import case_rows
 
 from .config import FINANCIAL_PAGE_MAX_WORKERS, FINANCIAL_LINE_ITEMS_DATASET
 from .financial_structural_extraction import extract_page_structure
-from .financial_llm_extraction import extract_page_visual_evidence
 from .financial_page_sources import (
     FinancialPageSource,
     load_document_pdf_bytes,
     load_financial_pages,
-    load_page_image_bytes,
 )
 from .financial_reconciliation import (
     build_rows_from_reconstruction,
@@ -84,25 +86,14 @@ def _process_page(
         except Exception as error:
             failures.append(f"PyMuPDF structural extraction failed: {error!r}")
 
-    # Stage 1b: single VLM visual pass over the rendered page image.
-    image_bytes = None
-    try:
-        image_bytes = load_page_image_bytes(page)
-    except Exception as error:
-        failures.append(f"Page image load failed: {error!r}")
-
-    visual_evidence, vlm_failures = extract_page_visual_evidence(
-        image_bytes,
-        page.page_image_mime_type,
-        page.page_number,
-        pdf_bytes=pdf_bytes,
-    )
-    failures.extend(vlm_failures)
+    # Second evidence source: the page's own verbatim OCR transcription,
+    # already produced at document intake (extraction.py) — no fresh VLM call.
+    transcription_text = page.page_text
 
     # Stage 2: text-LLM reconstruction cross-checking both evidence sources.
     try:
         reconstruction = reconstruct_page_transactions(
-            structural_evidence, visual_evidence, page.page_number,
+            structural_evidence, transcription_text, page.page_number,
         )
     except Exception as error:
         failures.append(f"Stage 2 reconstruction failed: {error!r}")

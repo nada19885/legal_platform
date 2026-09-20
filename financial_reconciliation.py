@@ -3,12 +3,18 @@ Text-LLM Reconstruction Engine — Stage 2 of the financial evidence-
 extraction pipeline.
 Location: lib/python/legal_platform/financial_reconciliation.py
 
-Takes Stage 1a's PyMuPDF structural evidence and Stage 1b's single VLM
-visual evidence for one page and asks a text LLM to reconcile them into
-clean transaction rows, with a per-field certainty flag. This replaces the
-old 2-of-3 majority-vote + VLM-arbitrator design: there is no longer a set
-of noisy repeats of the same reading to vote on, only two independent
-sources to cross-check against each other.
+Takes Stage 1a's PyMuPDF structural evidence and the page's transcription
+text (produced once, at document intake, by the general-purpose OCR VLM
+pass in extraction.py/vlm_adapter.py — not a fresh financial-specific VLM
+call) and asks a text LLM to reconcile them into clean transaction rows,
+with a per-field certainty flag. That intake OCR pass already transcribes
+every page verbatim, including table structure as markdown, at the same
+DPI the financial pipeline would otherwise re-render at — so re-reading the
+page with a second, specialized VLM call would buy no extra precision,
+only cost. This replaces the old 2-of-3 majority-vote + VLM-arbitrator
+design: there is no longer a set of noisy repeats of the same reading to
+vote on, only two independent sources (structural vs. transcribed) to
+cross-check against each other.
 """
 
 from __future__ import annotations
@@ -48,8 +54,12 @@ You receive TWO independent readings of the same page:
   headings (PyMuPDF). Exact and reliable wherever it is non-empty, but
   EMPTY on a scanned/image-only page — an empty value here just means "no
   structural evidence available", not a contradiction.
-- "visual_evidence": one VLM's visual reading of the rendered page image
-  (numbers, Arabic and English text, table layout, dates).
+- "transcription_text": a verbatim OCR transcription of the rendered page
+  image (numbers, Arabic and English text, tables rendered as markdown,
+  reading order preserved). This came from a general document-intake pass,
+  not a financial-specialized one — it is complete and verbatim, but not
+  pre-triaged, so it may still contain institutional headers/metadata mixed
+  in with genuine transactions.
 
 YOUR TASK:
 1. Reconcile Arabic/English direction and correspondence between the two
@@ -66,8 +76,8 @@ YOUR TASK:
 
 RULES:
 - Never invent a value neither source supports.
-- "sources.pymupdf" / "sources.vlm" must be the literal text each source
-  reported for that field, or null if that source had nothing for it.
+- "sources.pymupdf" / "sources.transcription" must be the literal text each
+  source reported for that field, or null if that source had nothing for it.
 - If both sources are silent on a field, its value is "" and certain is false.
 
 RETURN JSON ONLY:
@@ -75,14 +85,14 @@ RETURN JSON ONLY:
   "transactions": [
     {
       "row_index": 0,
-      "date": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "description": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "amount": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "currency": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "debit_or_credit": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "reference_number": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "party_source": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}},
-      "running_balance": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "vlm": ""}}
+      "date": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "description": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "amount": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "currency": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "debit_or_credit": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "reference_number": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "party_source": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
+      "running_balance": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}}
     }
   ]
 }
@@ -91,7 +101,7 @@ RETURN JSON ONLY:
 
 def reconstruct_page_transactions(
     structural_evidence: dict,
-    visual_evidence: dict,
+    transcription_text: str,
     page_number: int,
 ) -> dict:
     """Stage 2: one text-LLM call reconciling both evidence sources for a
@@ -101,7 +111,7 @@ def reconstruct_page_transactions(
     payload = {
         "page_number": page_number,
         "structural_evidence": structural_evidence,
-        "visual_evidence": visual_evidence,
+        "transcription_text": transcription_text,
     }
 
     last_error: Optional[Exception] = None
@@ -141,7 +151,7 @@ def build_rows_from_reconstruction(
             sources = info.get("sources") or {}
             candidates = [
                 {"value": str(sources[key]), "source": key}
-                for key in ("pymupdf", "vlm")
+                for key in ("pymupdf", "transcription")
                 if sources.get(key)
             ]
 
