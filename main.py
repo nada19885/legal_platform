@@ -1,4 +1,7 @@
-
+"""
+BSF Saudi Legal Case Workbench — Standard WebApp Backend
+File: backend.py
+"""
 
 import io
 import re
@@ -9,34 +12,41 @@ import uuid
 import base64
 import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-
-import pandas as pd
-from flask import request, jsonify, send_file, Response
-
-# The Flask `app` object is provided by the Dataiku Standard WebApp runtime.
-from dataiku.customwebapp import *  # noqa: F401,F403  -> exposes `app`
-
-### Added by Youssif for Monitoring Purposes ###
 import os
 import sys
+
+import pandas as pd
+from flask import request, jsonify, send_file, Response, copy_current_request_context
+from dataiku.customwebapp import *  
+import dataiku
+
+# -----------------------------------------------------------------------------
+# USAGE ANALYTICS & MONITORING
+# -----------------------------------------------------------------------------
 sys.path.insert(0, "/dataiku/design/plugins/dev/usage-analytics-lib/python-lib")
-from usageanalyticslib import write_usage_event
- 
+try:
+    from usageanalyticslib import write_usage_event
+except ImportError:
+    def write_usage_event(*args, **kwargs):
+        pass
+
 PROJECT_KEY = os.environ.get("DKU_CURRENT_PROJECT_KEY", "unknown_project")
- 
-def increment_usage(session_id, field, amount=1):
-    if session_id:
-        write_usage_event(PROJECT_KEY, session_id, field, amount)
-### END ###
+LITIGATION_PROJECT_KEY = f"{PROJECT_KEY}_LITIGATION"
+AGREEMENT_PROJECT_KEY = f"{PROJECT_KEY}_AGREEMENT"
+
+def increment_usage(session_id, field, amount=1, use_case="litigation"):
+    if not session_id:
+        return
+    virtual_key = AGREEMENT_PROJECT_KEY if use_case == "agreement" else LITIGATION_PROJECT_KEY
+    try:
+        write_usage_event(virtual_key, session_id, field, amount)
+    except Exception:
+        pass
 
 
-
-# ------------------------------------------------------------
-# legal_platform integrations — identical imports to legal_ui.py.
-# The webapp backend runs in the same Dataiku code environment, so the
-# package imports resolve exactly as before.
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# CORE LEGAL PLATFORM IMPORTS
+# -----------------------------------------------------------------------------
 from legal_platform.ids import random_id
 from legal_platform.intake import create_case, add_message
 from legal_platform.storage import list_cases, latest_case, case_rows
@@ -56,18 +66,18 @@ from legal_platform.agreement_workbench import (
     discuss_agreement,
 )
 
-# ------------------------------------------------------------
-# Accounting & forensic financial analysis — identical imports to the
-# Streamlit "Accounting analysis" tab (legal_ui.py). Same package, same
-# functions; only the calling convention (Flask route + job) differs.
-# ------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# ACCOUNTING & FORENSIC DISPUTE ENGINE IMPORTS
+# -----------------------------------------------------------------------------
 from legal_platform.config import (
+    APPROVALS_DATASET,
     FINANCIAL_DISCREPANCIES_DATASET,
     FINANCIAL_DOCUMENT_CLASSIFICATION_DATASET,
     FINANCIAL_FINDINGS_DATASET,
     FINANCIAL_LINE_ITEM_CORRECTIONS_DATASET,
     FINANCIAL_LINE_ITEMS_DATASET,
     FINANCIAL_TIMELINE_DATASET,
+    CASE_DOCUMENT_FOLDER_ID,
 )
 from legal_platform.financial_classification import classify_case_pages
 from legal_platform.financial_corrections import (
@@ -79,19 +89,56 @@ from legal_platform.financial_extraction_pipeline import run_financial_extractio
 from legal_platform.financial_forensics import (
     build_and_save_financial_timeline,
     load_saved_forensic_results,
-    run_discrepancy_and_findings_analysis,
+    run_claim_based_accounting_analysis,
 )
 from legal_platform.financial_normalizer import normalize_row_for_ledger
 
 APP_ASSETS_FOLDER_ID = "qx2RWzgX"
 APP_LOGO_PATH = "logo.png"
 
-ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+RUN_JOBS_INLINE = False
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+# =============================================================================
+# TESTING WORKFLOW BYPASS
+# =============================================================================
+# False = a prepared attorney summary is enough to continue downstream.
+# True  = require formal attorney approval and a clean case.
+# IMPORTANT: set this to True before production.
+REQUIRE_APPROVED_SUMMARY = False
 
 
-# ============================================================
-# JSON-safe serialisation of pandas frames / numpy scalars
-# ============================================================
+def approval_gate_passed(state):
+    """
+    Keep the real workflow dependencies while optionally bypassing formal
+    attorney approval during testing.
+
+    Testing mode (REQUIRE_APPROVED_SUMMARY = False):
+        - an attorney summary must exist
+        - formal approval is not required
+        - case_dirty does not block downstream testing
+
+    Production mode (REQUIRE_APPROVED_SUMMARY = True):
+        - an attorney summary must exist
+        - it must be formally approved
+        - the case must not be dirty
+    """
+    if not state or state.get("attorney_summary") is None:
+        return False
+
+    if not REQUIRE_APPROVED_SUMMARY:
+        return True
+
+    return (
+        bool(state.get("summary_approved"))
+        and not bool(state.get("case_dirty"))
+    )
+
+
+# =============================================================================
+# SANITIZATION HELPERS
+# =============================================================================
 def _clean_scalar(value):
     if value is None:
         return None
@@ -100,21 +147,12 @@ def _clean_scalar(value):
             return None
     except (TypeError, ValueError):
         pass
-    if isinstance(value, (pd.Timestamp,)):
+    if isinstance(value, pd.Timestamp):
         return str(value)
     return value
 
 
 def _json_safe(value):
-    """Recursively coerce a payload into strictly valid JSON.
-
-    Python's json module emits bare NaN / Infinity tokens, which are legal
-    Python but illegal JSON, so the browser rejects the whole response;
-    numpy scalars fail serialisation outright. Both arrive through
-    pandas-derived records and through workflow payloads that were stored
-    with those values already in them. _clean_scalar() covers only the
-    top level of the case row, so nested structures need this.
-    """
     if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, float):
@@ -128,7 +166,6 @@ def _json_safe(value):
     if isinstance(value, pd.Timestamp):
         return str(value)
     if hasattr(value, "item"):
-        # numpy scalars -> their Python equivalents
         try:
             return _json_safe(value.item())
         except (AttributeError, ValueError):
@@ -142,29 +179,19 @@ def _json_safe(value):
 
 
 def _ok(payload):
-    """Success responses go out through the sanitiser."""
     return jsonify(_json_safe(payload))
 
 
 def frame_to_records(frame):
-    """Serialise a DataFrame to a list of plain dicts (NaN -> "")."""
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return []
     return json.loads(frame.fillna("").to_json(orient="records", force_ascii=False))
 
 
-def _row_dict(frame_row):
-    return {k: _clean_scalar(v) for k, v in frame_row.items()}
-
-
-# ============================================================
-# Accounting & forensic analysis helpers — same calls as the Streamlit
-# accounting tab, reshaped for a JSON response instead of st.dataframe /
-# st.expander widgets.
-# ============================================================
+# =============================================================================
+# ACCOUNTING ANALYSIS HELPERS
+# =============================================================================
 def _build_normalized_ledger(case_id, line_items_df):
-    """Normalize every extracted line item against the latest attorney
-    corrections. Identical sequence to legal_ui.py's ledger build."""
     if line_items_df is None or line_items_df.empty:
         return []
     corrections = load_latest_corrections(case_id)
@@ -176,18 +203,25 @@ def _build_normalized_ledger(case_id, line_items_df):
     return ledger
 
 
-def _serialise_conflicts(case_id):
-    """Rows still needing manual verification, with each conflicted
-    field's candidate readings unpacked from fields_json so the frontend
-    never has to parse JSON-in-JSON."""
+def _serialise_conflicts(case_id, pages_df=None):
     rows = list_rows_needing_review(case_id) or []
     out = []
+    page_img_map = {}
+    if isinstance(pages_df, pd.DataFrame) and not pages_df.empty:
+        id_col = "case_document_page_id" if "case_document_page_id" in pages_df.columns else "page_id"
+        for _, r in pages_df.iterrows():
+            pid = str(r.get(id_col, ""))
+            if pid:
+                page_img_map[pid] = f"/page_image?case_id={case_id}&page_id={pid}"
+
     for row in rows:
         row_id = str(row.get("row_id", ""))
+        page_id = str(row.get("page_id", ""))
         try:
             fields = json.loads(row.get("fields_json", "{}") or "{}")
         except (TypeError, json.JSONDecodeError):
             fields = {}
+
         conflicted_fields = []
         if isinstance(fields, dict):
             for field_name, field_data in fields.items():
@@ -197,18 +231,21 @@ def _serialise_conflicts(case_id):
                         for c in (field_data.get("candidates") or [])
                     ]
                     conflicted_fields.append({"field": field_name, "candidates": candidates})
+
         if conflicted_fields:
             out.append({
                 "row_id": row_id,
+                "page_id": page_id,
                 "page_number": row.get("page_number"),
+                "page_image_url": page_img_map.get(page_id, f"/page_image?case_id={case_id}&page_id={page_id}"),
                 "fields": conflicted_fields,
             })
     return out
 
 
-# ============================================================
-# Case data loading — identical query set to legal_ui.load_case_data()
-# ============================================================
+# =============================================================================
+# CASE DATA LOADING
+# =============================================================================
 def load_case_data(case_id):
     data = {
         "case": latest_case(case_id) or {"case_id": case_id},
@@ -219,24 +256,172 @@ def load_case_data(case_id):
         "fact_candidates": case_rows("case_fact_candidates", case_id),
         "parties": case_rows("case_parties", case_id),
         "events": case_rows("case_events", case_id),
+        "contradictions": case_rows("case_contradictions", case_id),   # NEW
         "issues": case_rows("case_issues", case_id),
         "issue_candidates": case_rows("case_issue_candidates", case_id),
         "evidence": case_rows("case_evidence", case_id),
         "approvals": case_rows("case_approvals", case_id),
         "audit_events": case_rows("audit_events", case_id),
         "financial_line_items": case_rows(FINANCIAL_LINE_ITEMS_DATASET, case_id),
+        "financial_classifications": case_rows(FINANCIAL_DOCUMENT_CLASSIFICATION_DATASET, case_id),
     }
+    
     forensic = load_saved_forensic_results(case_id)
     data["financial_timeline"] = forensic.get("timeline", [])
-    data["forensic_findings"] = forensic.get("accounting_findings", {})
+    
+    # FIX: Point the backend to the new claim_evaluations array
+    data["forensic_findings"] = {"claim_evaluations": forensic.get("claim_evaluations", [])}
+    
     data["discrepancies"] = forensic.get("discrepancies", [])
     data["cross_check_summary"] = forensic.get("cross_check_summary", {})
+
     return data
+
+
+def _latest_classifications_by_page(data):
+    frame = data.get("financial_classifications")
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {}
+    working = frame.sort_values("created_at") if "created_at" in frame.columns else frame
+    latest = {}
+    for row in working.fillna("").to_dict(orient="records"):
+        page_id = str(row.get("page_id", "") or row.get("case_document_page_id", ""))
+        if not page_id:
+            continue
+        latest[page_id] = {
+            "page_type": str(row.get("page_type", "") or row.get("document_type", "")).lower().strip(),
+            "confidence": _clean_scalar(row.get("confidence")),
+        }
+    return latest
 
 
 def best(data, approved_key, candidate_key):
     return data[approved_key] if not data[approved_key].empty else data[candidate_key]
 
+
+# =============================================================================
+# PERSISTENCE & WORKFLOW STATE
+# =============================================================================
+WORKFLOW_KEYS = (
+    "attorney_summary",
+    "summary_approved",
+    "summary_approved_by",
+
+    "accounting_status",
+    "accounting_dirty",
+    "accounting_dirty_reason",
+
+    "research",
+    "analysis",
+    "strategy",
+    "memo",
+    "pleading_versions",
+    "pleading_status",
+    "pleading_finalised_by",
+
+    "case_dirty",
+    "dirty_reason",
+)
+
+
+def blank_workflow_state():
+    return {
+        "attorney_summary": None,
+        "summary_approved": False,
+        "summary_approved_by": "",
+
+        # Accounting lifecycle
+        "accounting_status": "not_started",
+        "accounting_dirty": False,
+        "accounting_dirty_reason": "",
+
+        "research": None,
+        "analysis": None,
+        "strategy": None,
+        "memo": None,
+        "pleading_versions": [],
+        "pleading_status": "draft",
+        "pleading_finalised_by": "",
+
+        "case_dirty": False,
+        "dirty_reason": "",
+    }
+
+def persist_deep_ui_state(case_id: str, state_dict: dict):
+    """Saves workflow state into case_approvals so browser reload never loses data."""
+    record = {
+        "approval_id": random_id("UISTATE"),
+        "case_id": str(case_id),
+        "approved_by": "UI_STATE_MANAGER",
+        "summary_json": json.dumps(state_dict, ensure_ascii=False),
+        "timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    try:
+        ds = dataiku.Dataset(APPROVALS_DATASET)
+        try:
+            ex_df = ds.get_dataframe()
+            if not ex_df.empty and "case_id" in ex_df.columns:
+                mask = (ex_df["case_id"].astype(str) == str(case_id)) & (ex_df["approved_by"].astype(str) == "UI_STATE_MANAGER")
+                ex_df = ex_df[~mask].copy()
+                df = pd.concat([ex_df, pd.DataFrame([record])], ignore_index=True)
+            else:
+                df = pd.DataFrame([record])
+        except Exception:
+            df = pd.DataFrame([record])
+        ds.write_with_schema(df)
+    except Exception as e:
+        print(f"Deep UI persistence failed: {e}")
+
+def restore_workflow_state(data):
+    state = blank_workflow_state()
+    case_id = str(data["case"].get("case_id", ""))
+
+    approvals = data.get("approvals")
+    if isinstance(approvals, pd.DataFrame) and not approvals.empty and "approved_by" in approvals.columns:
+        ui_states = approvals[approvals["approved_by"].astype(str) == "UI_STATE_MANAGER"]
+        if not ui_states.empty:
+            try:
+                latest_record = ui_states.iloc[-1].to_dict()
+                loaded = json.loads(str(latest_record.get("summary_json", "{}") or "{}"))
+                if isinstance(loaded, dict):
+                    state.update(loaded)
+                    return state
+            except Exception:
+                pass
+
+    audits = data.get("audit_events")
+    if isinstance(audits, pd.DataFrame) and not audits.empty and "entity_type" in audits.columns:
+        # 1. Try to load the new "case_workflow" format
+        states = audits[audits["entity_type"].astype(str) == "case_workflow"].copy()
+        if not states.empty:
+            if "event_at" in states.columns:
+                states = states.sort_values("event_at")
+            row = states.iloc[-1].to_dict()
+            try:
+                payload = json.loads(str(row.get("new_value_json", "{}") or "{}"))
+                if isinstance(payload, dict):
+                    for key in WORKFLOW_KEYS:
+                        if key in payload:
+                            state[key] = payload[key]
+            except Exception:
+                pass
+        else:
+            # 2. Fallback for legacy cases using "case_summary"
+            legacy_summaries = audits[audits["entity_type"].astype(str) == "case_summary"].copy()
+            if not legacy_summaries.empty:
+                if "event_at" in legacy_summaries.columns:
+                    legacy_summaries = legacy_summaries.sort_values("event_at")
+                row = legacy_summaries.iloc[-1].to_dict()
+                try:
+                    payload = json.loads(str(row.get("new_value_json", "{}") or "{}"))
+                    if isinstance(payload, dict):
+                        state["attorney_summary"] = payload
+                        state["summary_approved"] = True
+                        state["summary_approved_by"] = str(row.get("actor", ""))
+                except Exception:
+                    pass
+
+    return state
 
 def _frame_ids(frame, candidates):
     if frame is None or frame.empty:
@@ -246,10 +431,7 @@ def _frame_ids(frame, candidates):
             return sorted(frame[column].fillna("").astype(str).tolist())
     return [str(len(frame))]
 
-
 def case_fingerprint(data):
-    """Unchanged from legal_ui.py — used to detect record changes after a
-    completed workflow state so earlier work is invalidated correctly."""
     return {
         "documents": _frame_ids(data.get("documents"), ["case_document_id", "document_id"]),
         "pages": _frame_ids(data.get("pages"), ["case_document_page_id", "page_id"]),
@@ -258,171 +440,169 @@ def case_fingerprint(data):
         "issues_count": len(best(data, "issues", "issue_candidates")),
     }
 
-
-# ============================================================
-# Server-side workflow state
-#
-# The Streamlit app kept these keys in st.session_state and flushed them
-# to the audit log via persist_workflow_state(). Here we reconstruct the
-# same dict from the audit log on every request (restore_workflow_state)
-# and write it back the same way (persist_workflow_state). This is the
-# "reuse existing server persistence" strategy — no new store.
-# ============================================================
-WORKFLOW_KEYS = (
-    "attorney_summary", "summary_approved", "summary_approved_by", "research",
-    "analysis", "strategy", "memo", "pleading_versions", "pleading_status",
-    "pleading_finalised_by", "case_dirty", "dirty_reason",
-)
-
-
-def blank_workflow_state():
-    return {
-        "attorney_summary": None,
-        "summary_approved": False,
-        "summary_approved_by": "",
-        "research": None,
-        "analysis": None,
-        "strategy": None,
-        "memo": None,
-        "pleading_versions": [],
-        "pleading_status": "draft",
-        "pleading_finalised_by": "",
-        "case_dirty": False,
-        "dirty_reason": "",
-    }
-
-
-def restore_workflow_state(data):
-    """Port of legal_ui.restore_workflow_state — reads the latest
-    case_workflow audit payload, then applies the fingerprint dirty check.
-    Also restores an approved summary from the case_summary audit /
-    approvals tables, mirroring the original main-body restoration."""
-    state = blank_workflow_state()
-
-    audits = data.get("audit_events")
-    if isinstance(audits, pd.DataFrame) and not audits.empty and "entity_type" in audits.columns:
-        states = audits[audits["entity_type"].astype(str) == "case_workflow"].copy()
-        if not states.empty:
-            if "event_at" in states.columns:
-                states = states.sort_values("event_at")
-            row = states.iloc[-1].to_dict()
-            try:
-                payload = json.loads(str(row.get("new_value_json", "{}") or "{}"))
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            if isinstance(payload, dict):
-                for key in WORKFLOW_KEYS:
-                    if key in payload:
-                        state[key] = payload[key]
-                saved_fingerprint = payload.get("fingerprint") or {}
-                current_fingerprint = case_fingerprint(data)
-                if saved_fingerprint and saved_fingerprint != current_fingerprint:
-                    state["case_dirty"] = True
-                    state["dirty_reason"] = "The case record changed after the last completed workflow state."
-                    state["summary_approved"] = False
-
-    # Restore latest approved summary (main-body logic in legal_ui.py).
-    if state["attorney_summary"] is None and isinstance(audits, pd.DataFrame) and not audits.empty:
-        summary_audits = audits.copy()
-        if "entity_type" in summary_audits.columns and "action" in summary_audits.columns:
-            summary_audits = summary_audits[
-                (summary_audits["entity_type"].astype(str) == "case_summary")
-                & (summary_audits["action"].astype(str) == "approved")
-            ]
-            if not summary_audits.empty:
-                latest_audit = summary_audits.iloc[-1].to_dict()
-                try:
-                    restored = json.loads(str(latest_audit.get("new_value_json", "{}") or "{}"))
-                    if isinstance(restored, dict) and restored:
-                        state["attorney_summary"] = restored
-                        state["summary_approved"] = True
-                        state["summary_approved_by"] = str(latest_audit.get("actor", "") or "")
-                except (TypeError, json.JSONDecodeError):
-                    pass
-
-    approvals = data.get("approvals")
-    if isinstance(approvals, pd.DataFrame) and not approvals.empty and "approval_type" in approvals.columns:
-        summary_approvals = approvals[approvals["approval_type"].astype(str) == "case_summary"]
-        if not summary_approvals.empty:
-            latest_approval = summary_approvals.iloc[-1].to_dict()
-            state["summary_approved"] = str(latest_approval.get("decision", "")).lower() == "approved"
-            state["summary_approved_by"] = str(latest_approval.get("approved_by", "") or "")
-
-    return state
-
-
-def workflow_payload(state, data):
-    payload = {key: state.get(key) for key in WORKFLOW_KEYS}
-    payload["summary_approved"] = bool(state.get("summary_approved"))
-    payload["case_dirty"] = bool(state.get("case_dirty"))
-    payload["fingerprint"] = case_fingerprint(data)
-    return payload
-
-
 def persist_workflow_state(state, data, case_id, action="saved", actor="system", reason=""):
-    """Identical to legal_ui.persist_workflow_state — one audit write."""
+    persist_deep_ui_state(case_id, state)
     audit(
         case_id,
         "case_workflow",
         case_id,
         action,
         actor=actor,
-        new_value=workflow_payload(state, data),
+        new_value={key: state.get(key) for key in WORKFLOW_KEYS},
         reason=reason,
     )
 
-
 def invalidate_for_new_material(state, data, case_id, reason):
-    """Port of legal_ui.invalidate_for_new_material."""
     state["case_dirty"] = True
     state["dirty_reason"] = reason
-    state["attorney_summary"] = None
+
+    state["accounting_dirty"] = True
+    state["accounting_dirty_reason"] = reason
+
+    # Revoke approval so the pleading pipeline can't proceed on stale sign-off,
+    # but keep the actual generated content in place — the review, research,
+    # analysis, strategy, memo and pleading versions all stay visible and are
+    # simply marked stale by case_dirty / accounting_dirty until refreshed.
     state["summary_approved"] = False
     state["summary_approved_by"] = ""
-    state["research"] = None
-    state["analysis"] = None
-    state["strategy"] = None
-    state["memo"] = None
-    state["pleading_versions"] = []
-    state["pleading_status"] = "draft"
-    state["pleading_finalised_by"] = ""
-    persist_workflow_state(state, data, case_id, action="invalidated", reason=reason)
 
+    persist_workflow_state(
+        state,
+        data,
+        case_id,
+        action="invalidated",
+        reason=reason,
+    )
+    
+    
+def accounting_state(data, state):
+    """
+    Derives the current accounting stage from persisted accounting data
+    and the explicit workflow state.
 
-# ============================================================
-# Workflow steps + next action (ported from legal_ui.py, without the
-# translation calls — the frontend supplies the localised labels from
-# the step "key"). The state machine itself is unchanged.
-# ============================================================
+    An accounting run may legitimately produce zero financial line items,
+    so presence of line items must NOT be used as the completion flag —
+    accounting_status (set explicitly by the /accounting/* routes below)
+    is the single source of truth for "what stage are we at".
+    """
+    status = str(state.get("accounting_status", "not_started") or "not_started").strip().lower()
+
+    line_items = data.get("financial_line_items")
+    has_line_items = isinstance(line_items, pd.DataFrame) and not line_items.empty
+
+    classifications = data.get("financial_classifications")
+    has_classifications = isinstance(classifications, pd.DataFrame) and not classifications.empty
+
+    pending_conflicts = _serialise_conflicts(str(data["case"].get("case_id", "")), data.get("pages"))
+    has_pending_review = bool(pending_conflicts)
+
+    findings = data.get("forensic_findings") or {}
+    discrepancies = data.get("discrepancies") or []
+    has_forensic_output = bool(findings or discrepancies)
+
+    return {
+        "status": status,
+        "dirty": bool(state.get("accounting_dirty")),
+        "has_classifications": has_classifications,
+        "has_line_items": has_line_items,
+        "has_pending_review": has_pending_review,
+        "has_forensic_output": has_forensic_output,
+    }
+# =============================================================================
+# PROCEDURAL ORDERING HELPERS
+# =============================================================================
 def workflow_steps(state, data):
-    has_documents = not data["documents"].empty and not data["pages"].empty
+    has_documents = (
+        not data["documents"].empty
+        and not data["pages"].empty
+    )
+
+    accounting = accounting_state(data, state)
+    accounting_status = accounting["status"]
+
+    has_accounting = accounting_status in {
+        "classified",
+        "extracting",
+        "needs_review",
+        "ready_for_synthesis",
+        "normalized",
+        "forensic_complete",
+        "complete_no_transactions",
+    }
+
+    accounting_complete = accounting_status in {
+        "forensic_complete",
+        "complete_no_transactions",
+    }
+
     has_summary = state["attorney_summary"] is not None
-    approved = bool(state["summary_approved"]) and not state["case_dirty"]
-    has_analysis = state["analysis"] is not None and state["research"] is not None
+
+    # In testing mode a prepared summary is enough. In production this
+    # becomes formal approval + clean case through approval_gate_passed().
+    approved = approval_gate_passed(state)
+
+    has_analysis = state["analysis"] is not None
+    has_strategy = state["strategy"] = True
     has_pleading = state["memo"] is not None
-    is_final = has_pleading and state["pleading_status"] == "final"
+
+    is_final = (
+        has_pleading
+        and state["pleading_status"] == "final"
+    )
 
     states = [
-        {"key": "documents", "done": has_documents},
-        {"key": "summary", "done": approved, "started": has_summary},
-        {"key": "analysis", "done": has_analysis},
-        {"key": "pleading", "done": has_pleading},
-        {"key": "final", "done": is_final},
+        {
+            "key": "documents",
+            "done": has_documents,
+        },
+        {
+            "key": "facts",
+            "done": has_documents,
+        },
+        {
+            "key": "review",
+            "done": approved,
+            "started": has_summary,
+        },
+        {
+            "key": "accounting",
+            "done": accounting_complete,
+            "started": has_accounting,
+            "accounting_status": accounting_status,
+            "dirty": accounting["dirty"],
+        },
+        {
+            "key": "analysis",
+            "done": has_analysis,
+        },
+        {
+            "key": "pleading",
+            "done": has_pleading,
+        },
+        {
+            "key": "final",
+            "done": is_final,
+        },
+        {
+            "key": "discussion",
+            "done": True,
+        },
     ]
+
     current_found = False
+
     for step in states:
         if step["done"]:
             step["state"] = "complete"
+
         elif not current_found:
             step["state"] = "current"
             current_found = True
+
         else:
             step["state"] = "upcoming"
-    if is_final:
-        for step in states:
-            step["state"] = "complete"
-    return states
 
+    return states
 
 def next_action_key(state, data):
     steps = workflow_steps(state, data)
@@ -430,9 +610,6 @@ def next_action_key(state, data):
     return current["key"]
 
 
-# ============================================================
-# Ordering + page-reference helpers (ported verbatim from legal_ui.py)
-# ============================================================
 def _party_rank(role):
     text = str(role or "").lower()
     priorities = [
@@ -440,9 +617,6 @@ def _party_rank(role):
         (1, ("defendant", "respondent", "مدعى عليه", "مدعى عليها")),
         (2, ("appellant", "مستأنف")),
         (3, ("bank", "بنك", "مصرف")),
-        (4, ("witness", "شاهد")),
-        (5, ("expert", "خبير")),
-        (6, ("authority", "جهة", "نيابة", "شرطة")),
     ]
     for rank, words in priorities:
         if any(word in text for word in words):
@@ -461,8 +635,7 @@ def _chronology_key(item):
     raw = str(item.get("date", "") or "").strip()
     if not raw or str(item.get("date_precision", "")).lower() == "unknown":
         return (1, "9999-99-99", raw)
-    normal = raw.replace("/", "-")
-    return (0, normal, raw)
+    return (0, raw.replace("/", "-"), raw)
 
 
 def _ordered_chronology(items):
@@ -475,7 +648,7 @@ def _page_reference_map(data):
     if isinstance(doc_frame, pd.DataFrame) and not doc_frame.empty:
         for _, row in doc_frame.fillna("").iterrows():
             doc_id = str(row.get("case_document_id", "") or row.get("document_id", "") or "")
-            filename = str(row.get("original_filename", "") or row.get("file_name", "") or row.get("filename", "") or "Document")
+            filename = str(row.get("original_filename", "") or row.get("file_name", "") or "Document")
             if doc_id:
                 documents[doc_id] = filename
 
@@ -500,7 +673,7 @@ def _page_labels(source_ids, data):
         value = str(source_id or "").strip()
         if not value:
             continue
-        label = mapping.get(value, "Original page reference unavailable")
+        label = mapping.get(value, f"Page {value[:6]}")
         if label not in labels:
             labels.append(label)
     return labels
@@ -568,12 +741,54 @@ def serialise_case_card(item, workflow_type):
     }
 
 
-# ============================================================
-# Pleading export — memo_to_markdown + build_pleading_docx_bytes
-# ported verbatim so the .md / .docx output is byte-identical.
-# ============================================================
+def serialise_summary_support(summary, data):
+    """Preserves exactly what the LLM generated into standard arrays."""
+    if not isinstance(summary, dict):
+        return {}
+
+    chronology_list = summary.get("chronology") or []
+    parties_list = summary.get("parties") or []
+
+    evidence_list = []
+    for item in summary.get("available_evidence", []) or []:
+        if isinstance(item, dict):
+            page_ids = item.get("source_page_ids", []) or item.get("page_ids", []) or []
+            evidence_list.append({"item": item, "page_ids": page_ids, "page_labels": _page_labels(page_ids, data)})
+
+    contradictions_list = []
+    contradictions_frame = data.get("contradictions")
+    if isinstance(contradictions_frame, pd.DataFrame) and not contradictions_frame.empty:
+        for row in contradictions_frame.fillna("").to_dict(orient="records"):
+            try:
+                source_page_ids = json.loads(row.get("source_page_ids_json", "[]") or "[]")
+                if not isinstance(source_page_ids, list):
+                    source_page_ids = []
+            except (TypeError, json.JSONDecodeError):
+                source_page_ids = []
+            contradictions_list.append({
+                "description": row.get("description", ""),
+                "clarification_required": row.get("clarification_required", ""),
+                "source_page_ids": source_page_ids,
+                "page_labels": _page_labels(source_page_ids, data),
+            })
+
+    return {
+        "ordered_parties": _ordered_parties(parties_list),
+        "ordered_chronology": [
+            {"item": item, "page_labels": _page_labels(item.get("source_page_ids", []), data)}
+            for item in _ordered_chronology(chronology_list)
+        ],
+        "ordered_evidence": evidence_list,
+        "contradictions": contradictions_list,
+    }
+
 def memo_to_markdown(memo, language):
+    if not isinstance(memo, dict):
+        return str(memo or "")
     section = memo.get("pleading_ar" if language == "ar" else "pleading_en", {})
+    if isinstance(section, str):
+        return section
+
     title = memo.get("title_ar" if language == "ar" else "title_en", "")
     filing_type = memo.get("filing_type_ar" if language == "ar" else "filing_type_en", "")
     is_ar = language == "ar"
@@ -591,77 +806,42 @@ def memo_to_markdown(memo, language):
         if value:
             lines.append(str(value))
 
-    facts = section.get("facts", [])
-    if facts:
-        lines.append("## أولاً: الوقائع" if is_ar else "## I. Statement of Facts")
-        if isinstance(facts, str):
-            lines.append(facts)
-        else:
-            ordered = sorted(facts, key=lambda x: int(x.get("sequence", 999999) or 999999))
-            for item in ordered:
-                source = ""
-                if item.get("source_document"):
-                    source = str(item.get("source_document"))
-                    if item.get("source_page"):
-                        source += f" — {'الصفحة' if is_ar else 'page'} {item.get('source_page')}"
-                fact_text = item.get("fact", "")
-                date = item.get("date", "")
-                prefix = f"**{date}:** " if date else ""
-                lines.append(f"{item.get('sequence', '')}. {prefix}{fact_text}".strip())
-                if source:
-                    lines.append(f"*{'المصدر' if is_ar else 'Source'}: {source}*")
+    def _fmt(sec):
+        if isinstance(sec, str): return sec
+        if isinstance(sec, list):
+            res = []
+            for it in sec:
+                if isinstance(it, dict):
+                    d = it.get("date", "")
+                    f = it.get("fact") or it.get("supported_fact") or it.get("text", "")
+                    prefix = f"**{d}:** " if d else "- "
+                    res.append(f"{prefix}{f}")
+                else:
+                    res.append(f"- {str(it)}")
+            return "\n".join(res)
+        return str(sec or "")
 
-    sections = [
-        ("ثانياً: الدفوع الشكلية والإجرائية" if is_ar else "II. Procedural Defences", "procedural_defences"),
-        ("ثالثاً: الدفوع الموضوعية" if is_ar else "III. Substantive Defences", "substantive_defences"),
-    ]
-    for heading, key in sections:
-        items = section.get(key, [])
-        if items:
-            lines.append(f"## {heading}")
-            for idx, item in enumerate(items, 1):
-                lines.append(f"### {idx}. {item.get('heading', '')}")
-                if item.get("supported_fact"):
-                    lines.append(f"**{'الواقعة المستند إليها' if is_ar else 'Supported fact'}:** {item.get('supported_fact')}")
-                if item.get("authority"):
-                    lines.append(f"**{'السند النظامي' if is_ar else 'Authority'}:** {item.get('authority')}")
-                if item.get("application"):
-                    lines.append(f"**{'التطبيق' if is_ar else 'Application'}:** {item.get('application')}")
-                if item.get("requested_consequence"):
-                    lines.append(f"**{'الأثر المطلوب' if is_ar else 'Requested consequence'}:** {item.get('requested_consequence')}")
+    if section.get("facts"):
+        lines.append("## أولاً: الوقائع وتتبع حركة الأموال" if is_ar else "## I. Statement of Facts & Fund Flows")
+        lines.append(_fmt(section.get("facts")))
+    if section.get("procedural_defences"):
+        lines.append("## ثانياً: الدفوع الشكلية والإجرائية" if is_ar else "## II. Procedural Defences")
+        lines.append(_fmt(section.get("procedural_defences")))
+    if section.get("substantive_defences"):
+        lines.append("## ثالثاً: الدفوع الموضوعية والنظامية" if is_ar else "## III. Substantive Defences")
+        lines.append(_fmt(section.get("substantive_defences")))
+    if section.get("response_to_opponent"):
+        lines.append("## رابعاً: الرد على ادعاءات الخصم" if is_ar else "## IV. Response to Opposing Party")
+        lines.append(_fmt(section.get("response_to_opponent")))
+    if section.get("requests"):
+        lines.append("## خامساً: الطلبات الختامية" if is_ar else "## V. Relief Requested")
+        lines.append(_fmt(section.get("requests")))
+    if section.get("closing"):
+        lines.append(section.get("closing"))
+    if section.get("signature_block"):
+        lines.append(section.get("signature_block"))
 
-    rebuttals = section.get("response_to_opponent", [])
-    if rebuttals:
-        lines.append("## رابعاً: الرد على ادعاءات الخصم" if is_ar else "## IV. Response to the Opposing Party")
-        for idx, item in enumerate(rebuttals, 1):
-            lines.append(f"### {idx}. {item.get('allegation', '')}")
-            lines.append(item.get("response", ""))
-
-    requests = section.get("requests", [])
-    if requests:
-        lines.append("## خامساً: الطلبات" if is_ar else "## V. Relief Requested")
-        for index, item in enumerate(requests, 1):
-            if isinstance(item, dict):
-                text = item.get("text", "")
-                basis = item.get("basis", "")
-                lines.append(f"{index}. {text}")
-                if basis:
-                    lines.append(f"   *{'الأساس' if is_ar else 'Basis'}: {basis}*")
-            else:
-                lines.append(f"{index}. {item}")
-
-    reservations = section.get("evidence_reservations", []) or section.get("reservations", [])
-    if reservations:
-        lines.append("## التحفظات المتعلقة بالأدلة" if is_ar else "## Evidence Reservations")
-        lines.extend(f"- {item}" for item in reservations)
-
-    closing = section.get("closing", "")
-    if closing:
-        lines.extend(["## الختام" if is_ar else "## Closing", closing])
-    signature = section.get("signature_block", "")
-    if signature:
-        lines.append(signature)
-    return "\n\n".join(str(item) for item in lines if item)
+    return "\n\n".join(lines)
 
 
 def build_pleading_docx_bytes(memo, case_reference=""):
@@ -705,13 +885,8 @@ def build_pleading_docx_bytes(memo, case_reference=""):
     return buffer.getvalue()
 
 
-# ============================================================
-# Managed-folder asset reads (logo + rendered page images).
-# Identical to legal_ui._load_app_logo_data_uri / _load_page_image_bytes.
-# ============================================================
 def _load_app_logo_data_uri():
     try:
-        import dataiku
         folder = dataiku.Folder(APP_ASSETS_FOLDER_ID)
         with folder.get_download_stream(APP_LOGO_PATH) as stream:
             raw = stream.read()
@@ -724,8 +899,6 @@ def _load_page_image_bytes(page_image_path):
     if not page_image_path:
         return None
     try:
-        import dataiku
-        from legal_platform.config import CASE_DOCUMENT_FOLDER_ID
         folder = dataiku.Folder(CASE_DOCUMENT_FOLDER_ID)
         with folder.get_download_stream(page_image_path) as stream:
             return stream.read()
@@ -746,10 +919,6 @@ def _page_row(data, page_id):
     return match.iloc[0].to_dict()
 
 
-# ============================================================
-# Facts register serialisation (documents tab) — reproduces the
-# page-id resolution logic from legal_ui.py so click-to-source works.
-# ============================================================
 def serialise_facts_register(data):
     facts_register = best(data, "facts", "fact_candidates")
     rows = []
@@ -761,8 +930,15 @@ def serialise_facts_register(data):
         if not fact_text:
             continue
         fact_id = str(row.get("fact_id", "") or row.get("fact_candidate_id", ""))
-        page_ids = []
-        if str(row.get("page_number", "")).strip() and isinstance(pages_frame, pd.DataFrame) and not pages_frame.empty:
+
+        try:
+            page_ids = json.loads(row.get("source_page_ids_json", "[]") or "[]")
+            if not isinstance(page_ids, list):
+                page_ids = []
+        except (TypeError, json.JSONDecodeError):
+            page_ids = []
+
+        if not page_ids and str(row.get("page_number", "")).strip() and isinstance(pages_frame, pd.DataFrame) and not pages_frame.empty:
             doc_col = "case_document_id" if "case_document_id" in pages_frame.columns else None
             if doc_col and str(row.get("case_document_id", "")).strip():
                 match = pages_frame[
@@ -772,17 +948,17 @@ def serialise_facts_register(data):
                 id_col = "case_document_page_id" if "case_document_page_id" in pages_frame.columns else "page_id"
                 if not match.empty and id_col in match.columns:
                     page_ids = [str(match.iloc[0][id_col])]
+
         rows.append({
             "fact_id": fact_id,
             "fact_text": fact_text,
             "confidence": _clean_scalar(row.get("confidence")),
             "source_type": str(row.get("source_type", "") or ""),
-            "verification_status": str(row.get("verification_status", "") or ""),
+            "verification_status": str(row.get("verification_status", "") or row.get("candidate_status", "") or ""),
             "page_ids": page_ids,
             "page_labels": _page_labels(page_ids, data),
         })
     return rows
-
 
 def serialise_chat_messages(data):
     messages = data.get("messages")
@@ -798,86 +974,9 @@ def serialise_chat_messages(data):
     return out
 
 
-def serialise_summary_support(summary, data):
-    """Attach page-label strings for chronology/evidence so the frontend
-    can show the same 'Related evidence pages' text and click-to-source
-    without re-implementing the page-reference map."""
-    if not isinstance(summary, dict):
-        return {}
-    chronology = _ordered_chronology(summary.get("chronology", []))
-    parties = _ordered_parties(summary.get("parties", []))
-    evidence = []
-    for item in summary.get("available_evidence", []) or []:
-        if not isinstance(item, dict):
-            continue
-        page_ids = item.get("source_page_ids", []) or item.get("page_ids", []) or []
-        evidence.append({"item": item, "page_ids": page_ids, "page_labels": _page_labels(page_ids, data)})
-    return {
-        "ordered_parties": parties,
-        "ordered_chronology": [
-            {"item": item, "page_labels": _page_labels(item.get("source_page_ids", []), data)}
-            for item in chronology
-        ],
-        "ordered_evidence": evidence,
-    }
-
-
-# ============================================================
-# Background job infrastructure (async + progress polling)
-#
-# Streamlit blocked the run and drew a live progress bar. Standard
-# WebApps cannot block a request for a long LLM/extraction call without
-# risking a proxy timeout, so we run the SAME call in a worker thread and
-# expose its progress. The legal_platform calls, their arguments, and the
-# order of persistence writes are identical to the Streamlit handlers.
-# ============================================================
-# ------------------------------------------------------------
-# Execution mode
-#
-# RUN_JOBS_INLINE=True (the old default) runs every job synchronously
-# inside the Flask request thread, exactly like the original Streamlit
-# app. That defeats /job_status entirely: the HTTP request blocks for
-# the full duration of the LLM/extraction pipeline (which can be
-# minutes), so the webapp proxy can time it out mid-run.
-#
-# Backgrounding was previously abandoned because a raw daemon
-# threading.Thread was suspected of losing Dataiku's auth/connection
-# context. This codebase never impersonates the browsing user (no
-# get_auth_info_from_browser_headers / internal_ticket calls anywhere),
-# so per Dataiku's webapp-security model the backend authenticates as
-# one fixed service identity for the whole process — not something tied
-# to the Flask request/thread — and a background thread should carry it
-# fine. Rather than trust that theory blind a second time,
-# _dataiku_write_canary() below makes every backgrounded job prove it
-# can write to and read back from this case's own dataset BEFORE it
-# spends minutes on an LLM pipeline, so a real regression fails loudly
-# up front instead of silently dropping the final write.
-#
-# True  -> runs inline (emergency fallback only — flip this back if the
-#          canary starts failing in this Dataiku environment).
-# False -> background execution (default).
-# ------------------------------------------------------------
-RUN_JOBS_INLINE = False
-
-JOBS = {}
-JOBS_LOCK = threading.Lock()
-JOB_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="legal-platform-job")
-
-
-def _dataiku_write_canary(case_id):
-    """Prove this worker thread can write to and read back from Dataiku
-    before running an expensive pipeline on it. Raises loudly instead of
-    letting a real result be computed and then silently lost."""
-    marker_id = audit(case_id, "job_canary", case_id, "canary_write", actor="system")
-    rows = case_rows("audit_events", case_id)
-    ids = set(rows["audit_event_id"].astype(str)) if not rows.empty and "audit_event_id" in rows.columns else set()
-    if marker_id not in ids:
-        raise RuntimeError(
-            "Background job could not read back its own write to Dataiku from this "
-            "worker thread. Set RUN_JOBS_INLINE=True in main.py as an immediate fallback."
-        )
-
-
+# =============================================================================
+# ASYNC JOB COORDINATOR
+# =============================================================================
 def _new_job():
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
@@ -909,46 +1008,29 @@ def _finish_job(job_id, result=None, error=None):
             job["status"] = "done"
             job["result"] = result
 
-### Youssif added session_id here ###
-def _run_job(job_id, target, session_id=None):
-    """Run a unit of work and record its outcome against job_id.
 
-    The full traceback always goes to the webapp backend log (Logs tab)
-    and the exception type + message go to the browser, so a failure is
-    never silent at either end.
-    """
+def _run_job(job_id, target, session_id=None, use_case="litigation"):
     try:
         result = target()
         _finish_job(job_id, result=result)
-    except Exception as error:  # noqa: BLE001 -> mirror Streamlit's broad except with a user-facing message
+    except Exception as error:
         traceback.print_exc()
-        ### Added by Youssif for Monitoring Purposes ###
         if session_id:
-            increment_usage(session_id, "error_count",1)
-        ### END ###
+            increment_usage(session_id, "error_count", 1, use_case=use_case)
         _finish_job(job_id, error=f"{type(error).__name__}: {error}")
 
-### Youssif added session_id here ###
-def _run_async(job_id, target, case_id=None, session_id=None):
-    """Background by default; RUN_JOBS_INLINE=True is the emergency
-    fallback to the old synchronous behaviour."""
+
+def _run_async(job_id, target, session_id=None, use_case="litigation"):
     if RUN_JOBS_INLINE:
-        ### Youssif added session_id here ###
-        _run_job(job_id, target, session_id=session_id)
+        _run_job(job_id, target, session_id=session_id, use_case=use_case)
         return
-
-    def guarded():
-        if case_id:
-            try:
-                _dataiku_write_canary(case_id)
-            except Exception as error:
-                traceback.print_exc()
-                _finish_job(job_id, error=f"{type(error).__name__}: {error}")
-                return
-        ### Youssif added session_id here ###
-        _run_job(job_id, target, session_id=session_id)
-
-    JOB_EXECUTOR.submit(guarded)
+        
+    @copy_current_request_context
+    def _thread_target():
+        _run_job(job_id, target, session_id=session_id, use_case=use_case)
+        
+    thread = threading.Thread(target=_thread_target, daemon=True)
+    thread.start()
 
 
 @app.route("/job_status")
@@ -965,7 +1047,6 @@ def job_status():
         }
         if job["status"] == "done":
             payload["result"] = job["result"]
-        # Clear finished jobs after they are read once to avoid growth.
         if job["status"] in {"done", "error"}:
             JOBS.pop(job_id, None)
     return _ok(payload)
@@ -973,12 +1054,6 @@ def job_status():
 
 @app.route("/diagnostics")
 def diagnostics():
-    """Read-only: how many rows each case table actually holds.
-
-    Answers "did the extraction read anything?" directly. Open it in a
-    browser tab: <backend-url>/diagnostics?case_id=CASE_...
-    Nothing is written and no business function is called.
-    """
     case_id = request.args.get("case_id", "")
     if not case_id:
         return jsonify({"error": "case_id is required"}), 400
@@ -1006,9 +1081,9 @@ def diagnostics():
     })
 
 
-# ============================================================
-# Bootstrap + case library endpoints
-# ============================================================
+# =============================================================================
+# FLASK APPLICATION ROUTES
+# =============================================================================
 @app.route("/bootstrap")
 def bootstrap():
     return jsonify({
@@ -1048,11 +1123,79 @@ def create_case_endpoint():
     return jsonify({"case_id": case_id})
 
 
-# ============================================================
-# Case snapshot — replaces the whole st.session_state read for a case.
-# Returns the reconstructed workflow state plus everything the frontend
-# needs to render Home / Documents / Attorney review.
-# ============================================================
+
+@app.route("/accounting/run_auto_pipeline", methods=["POST"])
+def accounting_run_auto_pipeline():
+    body = request.get_json(force=True)
+    case_id = body.get("case_id", "")
+    session_id = body.get("session_id")
+    job_id = _new_job()
+
+    def task():
+        data = load_case_data(case_id)
+        state = restore_workflow_state(data)
+
+        # 1. Get all PAGE IDs
+        page_ids = []
+        if not data["pages"].empty:
+            id_col = "case_document_page_id" if "case_document_page_id" in data["pages"].columns else "page_id"
+            page_ids = data["pages"][id_col].dropna().astype(str).tolist()
+
+        if not page_ids:
+            return {"rows_persisted": 0}
+
+        # 2. Run Page-Level Classification
+        _set_progress(job_id, stage="classify", detail=f"1/2: Classifying {len(page_ids)} pages...")
+        classify_case_pages(case_id, page_ids)
+
+        # 3. Filter only financial & mixed pages
+        refreshed = load_case_data(case_id)
+        classifications = _latest_classifications_by_page(refreshed)
+        
+        financial_page_ids = []
+        for pid, cls_data in classifications.items():
+            if cls_data.get("page_type", "") in ["financial", "mixed"]:
+                financial_page_ids.append(pid)
+
+        # 4. Run Extraction on filtered pages
+        rows_persisted = 0
+        if financial_page_ids:
+            def _on_progress(current, total, page_id):
+                _set_progress(
+                    job_id, stage="extraction", current=current, total=total,
+                    detail=f"2/2: Extracting financial data (Page {current} of {total})..."
+                )
+            _set_progress(job_id, stage="extraction", detail="2/2: Extracting financial data...")
+            result = run_financial_extraction(case_id, financial_page_ids, progress_callback=_on_progress)
+            rows_persisted = result.get("rows_persisted", 0) if isinstance(result, dict) else 0
+
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 2)
+# 5. Update State
+        final_data = load_case_data(case_id)
+        state = restore_workflow_state(final_data)
+        pending = _serialise_conflicts(case_id, final_data.get("pages"))
+
+        # Look at the actual database using BOTH possible keys to be 100% safe
+        line_items_df = final_data.get("financial_line_items")
+        if line_items_df is None:
+            line_items_df = final_data.get("fin_line_items")
+            
+        has_items = line_items_df is not None and not line_items_df.empty
+
+        if pending:
+            state["accounting_status"] = "needs_review"
+        elif has_items or rows_persisted > 0:
+            state["accounting_status"] = "ready_for_synthesis"
+        else:
+            state["accounting_status"] = "complete_no_transactions"
+
+        persist_workflow_state(state, final_data, case_id, action="accounting_auto_pipeline_complete")
+        return {"rows_persisted": rows_persisted}
+    
+    _run_async(job_id, task, session_id=session_id)
+    return jsonify({"job_id": job_id})
+
 @app.route("/case")
 def case_endpoint():
     case_id = request.args.get("case_id", "")
@@ -1094,71 +1237,94 @@ def case_endpoint():
     response["next_action_key"] = next_action_key(state, data)
     response["chat_messages"] = serialise_chat_messages(data)
     response["facts_register"] = serialise_facts_register(data)
-    if state.get("attorney_summary"):
-        response["summary_support"] = serialise_summary_support(state["attorney_summary"], data)
+    response["summary_support"] = serialise_summary_support(state.get("attorney_summary") or {}, data)
 
+# --- accounting section ---
+    accounting_meta = accounting_state(data, state)
+    classifications_by_page = _latest_classifications_by_page(data) # <--- Use the new page function
+    
     response["accounting"] = {
+        "status": accounting_meta["status"],
+        "dirty": accounting_meta["dirty"],
+        "has_classifications": accounting_meta["has_classifications"],
+        "has_line_items": accounting_meta["has_line_items"],
+        "has_pending_review": accounting_meta["has_pending_review"],
         "documents": [
             {
                 "case_document_id": str(row.get("case_document_id", "")),
                 "original_filename": row.get("original_filename") or row.get("case_document_id", ""),
+                # Since we classify by page now, we leave the document-level UI badge blank
+                "classification": {}, 
             }
             for row in frame_to_records(data["documents"])
         ],
-        "has_line_items": not data["financial_line_items"].empty,
-        "pending_conflicts": _serialise_conflicts(case_id),
+        "pending_conflicts": _serialise_conflicts(case_id, data["pages"]),
         "normalized_ledger": _build_normalized_ledger(case_id, data["financial_line_items"]),
         "cross_check_summary": data.get("cross_check_summary") or {},
         "discrepancies": data.get("discrepancies") or [],
         "findings": data.get("forensic_findings") or {},
     }
     return _ok(response)
-
-
 def _load_state(case_id):
     data = load_case_data(case_id)
     return data, restore_workflow_state(data)
 
 
-# ============================================================
-# Litigation actions
-# ============================================================
+@app.route("/state/persist", methods=["POST"])
+def state_persist():
+    body = request.get_json(force=True)
+    case_id = str(body.get("case_id", ""))
+    state = body.get("state", {})
+    if not case_id:
+        return jsonify({"error": "case_id required"}), 400
+    persist_deep_ui_state(case_id, state)
+    return _ok({"persisted": True})
+
+
+# =============================================================================
+# INGESTION & DOCUMENT PROCESSING
+# =============================================================================
+class _MemoryUpload:
+    def __init__(self, name, raw, content_type=""):
+        self.name = name
+        self.type = content_type or mimetypes.guess_type(name or "")[0] or "application/octet-stream"
+        self.size = len(raw or b"")
+        self.id = uuid.uuid4().hex
+        self.file_id = self.id
+        self._raw = raw
+        self._buffer = io.BytesIO(raw)
+
+    def read(self, *args, **kwargs): return self._buffer.read(*args, **kwargs)
+    def seek(self, *args, **kwargs): return self._buffer.seek(*args, **kwargs)
+    def tell(self): return self._buffer.tell()
+    def getvalue(self): return self._raw
+    def getbuffer(self): return self._buffer.getbuffer()
+    def close(self): self._buffer.close()
+
+
 @app.route("/documents/process", methods=["POST"])
 def documents_process():
-    """Async: save_upload -> extract_pdf_page_by_page -> build_case_map ->
-    persist_case_map for each PDF, then invalidate_for_new_material. Same
-    calls/order as the Streamlit intake handler; progress reported live."""
     case_id = request.form.get("case_id", "")
     file_purpose = request.form.get("file_purpose", "full_case")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = request.form.get("session_id")
-    ### END ###
-    
     render_zoom = 1.6
     uploaded = request.files.getlist("files")
-    # Read the bytes and the MIME type now (the request context ends when
-    # the worker thread runs).
     payloads = [(f.filename, f.read(), f.mimetype) for f in uploaded]
     job_id = _new_job()
 
     def task():
-        total_pages = 0
-        usable_pages = 0
+        total_pages, usable_pages = 0, 0
         totals = {"facts": 0, "issues": 0, "parties": 0, "events": 0, "evidence_requests": 0}
-        status_counts = {}
-        failure_notes = []
-        ### Added by Youssif for Monitoring Purposes ###
+        status_counts, failure_notes = {}, []
         llm_call_count = 0
-        ### END ###
+
         for name, raw, content_type in payloads:
             document_row, pdf_bytes = save_upload(
                 case_id, _MemoryUpload(name, raw, content_type), document_type=file_purpose
             )
-
             def update_progress(current, total, page_number, state, _name=name):
                 _set_progress(job_id, stage="extract", current=current, total=total,
                               detail=f"{_name}: page {page_number}/{total} — {state}")
-
             pages = extract_pdf_page_by_page(
                 case_id=case_id,
                 case_document_id=document_row["case_document_id"],
@@ -1166,9 +1332,7 @@ def documents_process():
                 zoom=render_zoom,
                 progress_callback=update_progress,
             )
-            ### Added by Youssif for Monitoring Purposes ###
             llm_call_count += len(pages)
-            ### END ###
             completed_pages = [p for p in pages if p.get("processing_status") in {"completed", "completed_review_required"}]
             for page in pages:
                 page_status = str(page.get("processing_status", "") or "unknown")
@@ -1181,90 +1345,43 @@ def documents_process():
                         if note not in failure_notes:
                             failure_notes.append(note)
                         break
+
             total_pages += len(pages)
             usable_pages += len(completed_pages)
             if completed_pages:
                 case_map = build_case_map(completed_pages)
-                ### Added by Youssif for Monitoring Purposes ###
                 llm_call_count += 1
-                ### END ###
                 counts = persist_case_map(case_id, case_map)
                 for key in totals:
                     totals[key] += int(counts.get(key, 0) or 0)
-        ### Added by Youssif for Monitoring Purposes ###
+
         if llm_call_count:
-            increment_usage(session_id, "llm_request_count", llm_call_count)        
-        ### END ###
+            increment_usage(session_id, "llm_request_count", llm_call_count)
+        if payloads:
+            increment_usage(session_id, "attachment_count", len(payloads))
+
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
         invalidate_for_new_material(state, data, case_id, "New document or evidence was uploaded.")
-        ### Added by Youssif for Monitoring Purposes ###
-        if payloads:
-            increment_usage(session_id, "attachment_count", len(payloads))
-        ### END ###
-        
+
         return {
             "files": len(payloads),
             "usable": usable_pages,
             "total": total_pages,
-            # Diagnostics: what each page came back as, and the first few
-            # reasons pages were rejected. Empty on a healthy run.
             "page_status": status_counts,
             "page_errors": failure_notes[:3],
             **totals,
         }
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
-
-
-class _MemoryUpload:
-    """Adapter so save_upload receives the same interface Streamlit's
-    UploadedFile provided.
-
-    Streamlit's UploadedFile exposes .name, .type, .size and .id on top of
-    the stream methods, and save_upload reads .type to record the MIME
-    type. Only .name and the stream methods were reproduced originally,
-    which is why processing raised AttributeError on the first upload.
-    """
-
-    def __init__(self, name, raw, content_type=""):
-        self.name = name
-        self.type = content_type or mimetypes.guess_type(name or "")[0] or "application/octet-stream"
-        self.size = len(raw or b"")
-        # A local stand-in for Streamlit's file id. It is never persisted,
-        # so it deliberately does not use legal_platform's random_id().
-        self.id = uuid.uuid4().hex
-        self.file_id = self.id
-        self._raw = raw
-        self._buffer = io.BytesIO(raw)
-
-    def read(self, *args, **kwargs):
-        return self._buffer.read(*args, **kwargs)
-
-    def seek(self, *args, **kwargs):
-        return self._buffer.seek(*args, **kwargs)
-
-    def tell(self):
-        return self._buffer.tell()
-
-    def getvalue(self):
-        return self._raw
-
-    def getbuffer(self):
-        return self._buffer.getbuffer()
-
-    def close(self):
-        self._buffer.close()
 
 
 @app.route("/documents/review_completeness", methods=["POST"])
 def documents_review_completeness():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     data, state = _load_state(case_id)
     interview_state = body.get("interview_state")
     result = assess_next_step(
@@ -1274,10 +1391,8 @@ def documents_review_completeness():
         legal_research=((state.get("research") or {}).get("authority_nodes", [])),
         previous_state=interview_state,
     )
-    ### Added by Youssif for Monitoring Purposes ###
-    increment_usage(session_id, "llm_request_count",1)
-    increment_usage(session_id, "message_count",1)
-    ### END ###
+    increment_usage(session_id, "llm_request_count", 1)
+    increment_usage(session_id, "message_count", 1)
     persist_interview_state(case_id, result["decision"].payload)
     return _ok({"reply": result["reply"], "interview_state": result["decision"].payload})
 
@@ -1299,9 +1414,7 @@ def documents_review_completeness():
 def accounting_classify_documents():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
@@ -1322,10 +1435,6 @@ def accounting_classify_documents():
 
 @app.route("/accounting/clear", methods=["POST"])
 def accounting_clear():
-    """Fresh-start reset: same four datasets the Streamlit reset button
-    wipes, filtered down to the current case only."""
-    import dataiku
-
     body = request.get_json(force=True)
     case_id = str(body.get("case_id", ""))
     if not case_id:
@@ -1336,6 +1445,7 @@ def accounting_clear():
         FINANCIAL_TIMELINE_DATASET,
         FINANCIAL_DISCREPANCIES_DATASET,
         FINANCIAL_FINDINGS_DATASET,
+        FINANCIAL_DOCUMENT_CLASSIFICATION_DATASET,  # was missing
     ]:
         try:
             dataset = dataiku.Dataset(dataset_name)
@@ -1344,44 +1454,22 @@ def accounting_clear():
                 dataset.write_with_schema(frame[frame["case_id"].astype(str) != case_id])
         except Exception:
             traceback.print_exc()
+
+    data = load_case_data(case_id)
+    state = restore_workflow_state(data)
+    state["accounting_status"] = "not_started"
+    state["accounting_dirty"] = False
+    state["accounting_dirty_reason"] = ""
+    persist_workflow_state(state, data, case_id, action="accounting_cleared")
+
     return _ok({"cleared": True})
 
 
-@app.route("/accounting/extract", methods=["POST"])
-def accounting_extract():
-    """Async: dual-resolution (150 vs 250 DPI) visual extraction and
-    cross-source reconciliation over the selected documents."""
-    body = request.get_json(force=True)
-    case_id = body.get("case_id", "")
-    document_ids = [str(d) for d in (body.get("document_ids") or [])]
-    ### Added by Youssif for Monitoring Purposes ###
-    session_id = body.get("session_id")
-    ### END ###
-    if not document_ids:
-        return jsonify({"error": "Select at least one document."}), 400
-    job_id = _new_job()
 
-    def task():
-        def _on_progress(current, total, page_id):
-            _set_progress(
-                job_id, stage="extraction", current=current, total=total,
-                detail=f"Extracting page {current} of {total}…" if total else "Extracting…",
-            )
-        _set_progress(job_id, stage="extraction", detail="Starting dual-resolution extraction…")
-        result = run_financial_extraction(case_id, document_ids, progress_callback=_on_progress)
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count", 1)
-        ### END ###
-        rows_persisted = result.get("rows_persisted", 0) if isinstance(result, dict) else 0
-        return {"rows_persisted": rows_persisted}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
-    return jsonify({"job_id": job_id})
 
 
 @app.route("/accounting/correction", methods=["POST"])
 def accounting_correction():
-    """Attorney resolves one conflicted field on one extracted row."""
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
     row_id = str(body.get("row_id", ""))
@@ -1390,81 +1478,114 @@ def accounting_correction():
     corrected_by = str(body.get("corrected_by", "") or "attorney")
     if not (case_id and row_id and field_name):
         return jsonify({"error": "case_id, row_id and field_name are required."}), 400
+
     submit_correction(case_id, row_id, field_name, value, corrected_by=corrected_by)
+
+    data = load_case_data(case_id)
+    state = restore_workflow_state(data)
+    if str(state.get("accounting_status", "")).lower() == "needs_review":
+        pending = _serialise_conflicts(case_id, data.get("pages"))
+        if not pending:
+            state["accounting_status"] = "ready_for_synthesis"
+            persist_workflow_state(state, data, case_id, action="accounting_conflicts_resolved")
+
     return _ok({"saved": True})
 
 
 @app.route("/accounting/synthesize", methods=["POST"])
 def accounting_synthesize():
-    """Async: build the forensic timeline, then run the cross-check /
-    discrepancy / findings analysis over the normalized ledger."""
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
+    instructions = body.get("instructions", "")
     session_id = body.get("session_id")
-    ### END ###
-    job_id = _new_job()
-
-    def task():
-        data = load_case_data(case_id)
-        line_items_df = data["financial_line_items"]
-        if line_items_df.empty:
-            raise ValueError("No extracted line items available. Run extraction first.")
-        normalized_ledger = _build_normalized_ledger(case_id, line_items_df)
-        _set_progress(job_id, stage="timeline", detail="Building forensic financial timeline…")
-        build_and_save_financial_timeline(case_id, normalized_ledger)
-        _set_progress(job_id, stage="findings", detail="Checking numbers agreement and categorizing variances…")
-        run_discrepancy_and_findings_analysis(case_id, normalized_ledger)
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count", 1)
-        increment_usage(session_id, "message_count", 1)
-        ### END ###
-        refreshed = load_case_data(case_id)
-        return {
-            "cross_check_summary": refreshed.get("cross_check_summary") or {},
-            "discrepancies": refreshed.get("discrepancies") or [],
-            "findings": refreshed.get("forensic_findings") or {},
-        }
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
-    return jsonify({"job_id": job_id})
-
-
-@app.route("/summary/prepare", methods=["POST"])
-def summary_prepare():
-    body = request.get_json(force=True)
-    case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
-    session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
-        _set_progress(job_id, stage="summary", detail="Preparing consolidated attorney review…")
-        summary = generate_case_summary(
-            case_record=data["case"], documents=data["documents"], document_pages=data["pages"],
-            facts=data["facts"], fact_candidates=data["fact_candidates"], parties=data["parties"],
-            events=data["events"], issues=data["issues"], issue_candidates=data["issue_candidates"],
-            evidence=data["evidence"], legal_research=((state.get("research") or {}).get("authority_nodes", [])),
-            messages=data["messages"],
-        )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
-        state["attorney_summary"] = summary
-        state["summary_approved"] = False
-        state["memo"] = None
-        state["case_dirty"] = False
-        state["dirty_reason"] = ""
-        persist_workflow_state(state, load_case_data(case_id), case_id, action="summary_prepared")
-        return {"attorney_summary": summary, "summary_support": serialise_summary_support(summary, data)}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
-    return jsonify({"job_id": job_id})
+        line_items_df = data["financial_line_items"]
+        if line_items_df.empty:
+            raise ValueError("No extracted line items available. Run extraction first.")
+            
+        normalized_ledger = _build_normalized_ledger(case_id, line_items_df)
+        
+        # Pull claims from the attorney summary allegations
+        summary = state.get("attorney_summary", {})
+        customer_claims = summary.get("allegations", [])
+        
+        _set_progress(job_id, stage="timeline", detail="Building chronological timeline…")
+        build_and_save_financial_timeline(case_id, normalized_ledger)
+        
+        _set_progress(job_id, stage="findings", detail="Evaluating claims against financial ledger…")
+        # Call the new claim-based engine
+        from legal_platform.financial_forensics import run_claim_based_accounting_analysis
+        run_claim_based_accounting_analysis(case_id, normalized_ledger, customer_claims, instructions)
+        
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 1)
 
+        refreshed = load_case_data(case_id)
+        state = restore_workflow_state(refreshed)
+        state["accounting_status"] = "forensic_complete" if normalized_ledger else "complete_no_transactions"
+        persist_workflow_state(state, refreshed, case_id, action="accounting_synthesized")
+
+        return {"findings": refreshed.get("forensic_findings") or {}}
+
+    _run_async(job_id, task, session_id=session_id)
+    return jsonify({"job_id": job_id})
+# =============================================================================
+# SUMMARY, ANALYSIS & WRITTEN PLEADING ENDPOINTS
+# =============================================================================
+@app.route("/summary/prepare", methods=["POST"])
+def summary_prepare():
+    body = request.get_json(force=True)
+    case_id = body.get("case_id", "")
+    session_id = body.get("session_id")
+    job_id = _new_job()
+
+    def task():
+            data = load_case_data(case_id)
+            state = restore_workflow_state(data)
+            _set_progress(job_id, stage="summary", detail="Preparing consolidated attorney review…")
+
+            # Get classifications to find claim/mixed pages
+            classifications = _latest_classifications_by_page(data)
+            claim_page_ids = [
+                pid for pid, cls in classifications.items() 
+                if cls.get("page_type") in ["claim", "mixed"]
+            ]
+
+            # Filter pages: if we found claim pages, use them. If none found, fallback to all pages.
+            if claim_page_ids and not data["pages"].empty:
+                id_col = "case_document_page_id" if "case_document_page_id" in data["pages"].columns else "page_id"
+                filtered_pages = data["pages"][data["pages"][id_col].astype(str).isin(claim_page_ids)]
+            else:
+                filtered_pages = data["pages"]
+
+            summary = generate_case_summary(
+                case_record=data["case"],
+                pages=filtered_pages,  # <--- NOW ONLY PASSES CLAIM PAGES!
+                facts=best(data, "facts", "fact_candidates"),
+                evidence=data["evidence"],
+                parties=data["parties"],
+                events=data["events"],
+                force_rerun=True,
+            )
+
+            if session_id:
+                increment_usage(session_id, "llm_request_count", 1)
+                increment_usage(session_id, "message_count", 1)
+
+            state["attorney_summary"] = summary
+            state["summary_approved"] = False
+            persist_workflow_state(state, data, case_id, action="summary_prepared")
+            response_summary = dict(summary)
+            if data.get("forensic_findings"):
+                response_summary["forensic_findings"] = data["forensic_findings"]
+
+            return {"attorney_summary": response_summary, "summary_support": serialise_summary_support(summary, data)}
+    _run_async(job_id, task, session_id=session_id)
+    return jsonify({"job_id": job_id})
 
 @app.route("/summary/approve", methods=["POST"])
 def summary_approve():
@@ -1476,44 +1597,45 @@ def summary_approve():
     summary = state.get("attorney_summary")
     if not summary or not reviewer:
         return jsonify({"error": "A prepared summary and reviewer name are required."}), 400
-    approval_id = approve_case_summary(case_id, summary, reviewer, comments)
+    approval_record = approve_case_summary(case_id, summary, reviewer, comments)
     state["summary_approved"] = True
     state["summary_approved_by"] = reviewer
-    state["memo"] = None
     state["case_dirty"] = False
     state["dirty_reason"] = ""
-    persist_workflow_state(state, load_case_data(case_id), case_id, action="summary_approved", actor=reviewer)
-    return _ok({"approval_id": approval_id, "workflow_state": state})
-
+    persist_workflow_state(state, data, case_id, action="summary_approved", actor=reviewer)
+    return _ok({"approval_id": approval_record["approval_id"], "workflow_state": state})
 
 @app.route("/analysis/run", methods=["POST"])
 def analysis_run():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
+        if not approval_gate_passed(state):
+            raise ValueError(
+                "Prepare the consolidated attorney review first."
+                if not REQUIRE_APPROVED_SUMMARY
+                else "Approve the consolidated attorney review first."
+            )
         facts = best(data, "facts", "fact_candidates")
         issues = best(data, "issues", "issue_candidates")
         if facts.empty or issues.empty:
             raise ValueError("Extracted facts and issues are required.")
-        _set_progress(job_id, stage="analysis", detail="Retrieving applicable-law authorities…")
+        _set_progress(job_id, stage="analysis", detail="Retrieving SAMA authorities and evaluating legal defenses…")
         result = run_legal_analysis(data["case"], facts, issues, data["evidence"])
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 1)
+            increment_usage(session_id, "message_count", 1)
         state["research"] = result["research"]
         state["analysis"] = result["analysis"]
-        persist_workflow_state(state, load_case_data(case_id), case_id, action="analysis_prepared")
+        persist_workflow_state(state, data, case_id, action="analysis_prepared")
         return {"research": state["research"], "analysis": state["analysis"]}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1521,30 +1643,31 @@ def analysis_run():
 def analysis_defence_plan():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
-        if not state.get("summary_approved"):
-            raise ValueError("Approve the consolidated attorney review first.")
+        if not approval_gate_passed(state):
+            raise ValueError(
+                "Prepare the consolidated attorney review first."
+                if not REQUIRE_APPROVED_SUMMARY
+                else "Approve the consolidated attorney review first."
+            )
         _set_progress(job_id, stage="defence", detail="Developing defence plan…")
         strategy = run_defence_plan(
             data["case"], state["analysis"], best(data, "facts", "fact_candidates"),
             data["evidence"], state["research"]["authority_nodes"],
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 1)
+            increment_usage(session_id, "message_count", 1)
         state["strategy"] = strategy
-        persist_workflow_state(state, load_case_data(case_id), case_id, action="defence_plan_prepared")
+        persist_workflow_state(state, data, case_id, action="defence_plan_prepared")
         return {"strategy": strategy}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1554,38 +1677,44 @@ def pleading_generate():
     case_id = body.get("case_id", "")
     memo_instructions = body.get("instructions", "")
     direct = bool(body.get("direct", False))
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
+        if not approval_gate_passed(state):
+            raise ValueError(
+                "Prepare the consolidated attorney review first."
+                if not REQUIRE_APPROVED_SUMMARY
+                else "Approve the consolidated attorney review first."
+            )
         case = data["case"]
-        _set_progress(job_id, stage="pleading", detail="Drafting written pleading…")
+        _set_progress(job_id, stage="pleading", detail="Synthesizing bilingual court pleading…")
         instructions = (
             "Prepare a complete formal defence pleading exclusively on behalf of Banque Saudi Fransi (BSF)."
-            if direct else memo_instructions
+            if direct else (memo_instructions or "Prepare a complete formal defence pleading on behalf of BSF.")
         )
+        summary_obj = dict(state.get("attorney_summary") or {})
+        if data.get("forensic_findings"):
+            summary_obj["forensic_findings"] = data["forensic_findings"]
         memo = generate_bilingual_memo(
-            case, state["attorney_summary"], state["analysis"], state["strategy"],
-            state["research"], instructions,
+            case, summary_obj, state.get("analysis"), state.get("strategy"),
+            state.get("research"), instructions,
             case_data=data,
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 1)
+            increment_usage(session_id, "message_count", 1)
         state["memo"] = memo
         note = "Initial approved-summary draft" if direct else (memo_instructions or "Initial pleading draft")
         state["pleading_versions"] = [{"version": 1, "draft": memo, "note": note}]
         state["pleading_status"] = "draft"
         state["pleading_finalised_by"] = ""
-        persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_prepared")
+        persist_workflow_state(state, data, case_id, action="pleading_prepared")
         return {"memo": memo, "pleading_versions": state["pleading_versions"], "pleading_status": "draft"}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1594,9 +1723,7 @@ def pleading_revise():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
     revision_request = body.get("revision_request", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
@@ -1612,23 +1739,22 @@ def pleading_revise():
             state["research"],
             case_data=data,
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        if session_id:
+            increment_usage(session_id, "llm_request_count", 1)
+            increment_usage(session_id, "message_count", 1)
         version_no = len(state["pleading_versions"]) + 1
         state["memo"] = revised
         state["pleading_versions"].append({"version": version_no, "draft": revised, "note": revision_request})
         state["pleading_status"] = "draft"
-        persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_revised", reason=revision_request)
+        persist_workflow_state(state, data, case_id, action="pleading_revised", reason=revision_request)
         return {
             "memo": revised,
             "pleading_versions": state["pleading_versions"],
             "pleading_status": "draft",
             "version": version_no,
         }
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1647,7 +1773,7 @@ def pleading_restore_version():
         "version": version_no, "draft": selected["draft"],
         "note": f"Restored from version {selected_version}",
     })
-    persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_version_restored")
+    persist_workflow_state(state, data, case_id, action="pleading_version_restored")
     return _ok({"memo": state["memo"], "pleading_versions": state["pleading_versions"]})
 
 
@@ -1661,7 +1787,7 @@ def pleading_mark_final():
     data, state = _load_state(case_id)
     state["pleading_status"] = "final"
     state["pleading_finalised_by"] = final_reviewer
-    persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_finalised", actor=final_reviewer)
+    persist_workflow_state(state, data, case_id, action="pleading_finalised", actor=final_reviewer)
     return jsonify({"pleading_status": "final", "pleading_finalised_by": final_reviewer})
 
 
@@ -1672,7 +1798,7 @@ def pleading_reopen():
     data, state = _load_state(case_id)
     state["pleading_status"] = "draft"
     state["pleading_finalised_by"] = ""
-    persist_workflow_state(state, load_case_data(case_id), case_id, action="pleading_reopened")
+    persist_workflow_state(state, data, case_id, action="pleading_reopened")
     return jsonify({"pleading_status": "draft"})
 
 
@@ -1712,6 +1838,7 @@ def discussion_ask():
     conversation_id = body.get("conversation_id", "")
     question = body.get("question", "")
     add_to_record = bool(body.get("add_to_record", False))
+    session_id = body.get("session_id")
     job_id = _new_job()
 
     def task():
@@ -1722,7 +1849,9 @@ def discussion_ask():
             question, data["case"], state["attorney_summary"], state["analysis"],
             state["strategy"], state["research"], case_data=data,
         )
-        # Persist the assistant reply text (bilingual payload returned to client).
+        increment_usage(session_id, "llm_request_count", 2)
+        increment_usage(session_id, "message_count", 1)
+
         assistant_text = json.dumps({
             "answer_ar": answer.get("answer_ar", ""),
             "answer_en": answer.get("answer_en", ""),
@@ -1730,24 +1859,18 @@ def discussion_ask():
             "source_ids": answer.get("source_ids") or [],
         }, ensure_ascii=False)
         add_message(case_id, conversation_id, "assistant", assistant_text)
+
         if add_to_record:
             add_fact_candidate(
                 case_id=case_id, fact_text=question, source_type="chat",
                 source_id=message_id, fact_type="user_statement", quote=question, confidence=0.65,
             )
-            invalidate_for_new_material(
-                state, load_case_data(case_id), case_id,
-                "A discussion message was explicitly added to the formal case record.",
-            )
-        return {"answer": answer, "invalidated": add_to_record}
+        return {"answer": answer, "invalidated": False}
 
-    _run_async(job_id, task, case_id=case_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
-# ============================================================
-# Page image + extracted text (click-to-source)
-# ============================================================
 @app.route("/page_image")
 def page_image():
     case_id = request.args.get("case_id", "")
@@ -1774,16 +1897,13 @@ def page_text():
     return _ok({"label": label, "text": str(row.get("page_text", "") or "")[:4000]})
 
 
-# ============================================================
-# Fact / clause verify-flag-note controls (append-only audit)
-# ============================================================
 @app.route("/flag", methods=["POST"])
 def flag_control():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
     entity_type = body.get("entity_type", "")
     entity_id = body.get("entity_id", "")
-    action = body.get("action", "")  # verified | flagged | corrected
+    action = body.get("action", "")
     actor = body.get("actor", "") or "attorney"
     reason = body.get("reason", "")
     if action not in {"verified", "flagged", "corrected"}:
@@ -1792,15 +1912,13 @@ def flag_control():
     return jsonify({"ok": True})
 
 
-# ============================================================
-# Agreement workflow endpoints
-# ============================================================
+# =============================================================================
+# AGREEMENT WORKFLOW ENDPOINTS
+# =============================================================================
 @app.route("/agreement/process", methods=["POST"])
 def agreement_process():
     case_id = request.form.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = request.form.get("session_id")
-    ### END ###
     try:
         zoom = float(request.form.get("zoom", "1.6"))
     except ValueError:
@@ -1811,36 +1929,29 @@ def agreement_process():
 
     def task():
         processed = 0
-        ### Added by Youssif for Monitoring Purposes ###
         llm_call_count = 0
-        ### END ###
         for name, raw, content_type in payloads:
             document_row, pdf_bytes = save_upload(case_id, _MemoryUpload(name, raw, content_type), document_type="agreement")
-
             def on_page(current, total, page_number, state, _name=name):
                 _set_progress(job_id, stage="extract", current=current, total=total,
                               detail=f"{_name}: page {page_number}/{total} — {state}")
-
             pages = extract_pdf_page_by_page(
                 case_id=case_id,
                 case_document_id=document_row["case_document_id"],
                 pdf_bytes=pdf_bytes, zoom=zoom,
                 progress_callback=on_page,
             )
-             ### Added by Youssif for Monitoring Purposes ###
             llm_call_count += len(pages)
-            ### END ###
             if pages:
                 processed += 1
-        ### Added by Youssif for Monitoring Purposes ###
+
         if llm_call_count:
-            increment_usage(session_id, "llm_request_count", llm_call_count)
+            increment_usage(session_id, "llm_request_count", llm_call_count, use_case="agreement")
         if processed:
-            increment_usage(session_id, "attachment_count", processed)
-        ### END ###
+            increment_usage(session_id, "attachment_count", processed, use_case="agreement")
         return {"processed": processed}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id, use_case="agreement")
     return jsonify({"job_id": job_id})
 
 
@@ -1848,24 +1959,19 @@ def agreement_process():
 def agreement_classify():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
         data = load_case_data(case_id)
         _set_progress(job_id, stage="classify", detail="Detecting agreement type and relationship…")
         result = classify_agreement(data["pages"])
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        increment_usage(session_id, "llm_request_count", 1, use_case="agreement")
+        increment_usage(session_id, "message_count", 1, use_case="agreement")
         save_agreement_state(case_id, "classification", result)
         return {"classification": result}
 
-    ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id, use_case="agreement")
     return jsonify({"job_id": job_id})
 
 
@@ -1891,9 +1997,7 @@ def agreement_confirm_classification():
 def agreement_extract_clauses():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
@@ -1914,14 +2018,12 @@ def agreement_extract_clauses():
             page_progress_callback=on_page,
             chunk_progress_callback=on_chunk,
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        increment_usage(session_id, "llm_request_count", 1, use_case="agreement")
+        increment_usage(session_id, "message_count", 1, use_case="agreement")
         save_agreement_state(case_id, "clause_map", clause_map)
         return {"clause_map": clause_map}
-    ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id, use_case="agreement")
     return jsonify({"job_id": job_id})
 
 
@@ -1930,9 +2032,7 @@ def agreement_run_review():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
     instructions = body.get("instructions", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
@@ -1947,16 +2047,14 @@ def agreement_run_review():
         review, authorities = run_agreement_review(
             clause_map, profile, instructions=instructions, progress_callback=on_review,
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        increment_usage(session_id, "llm_request_count", 1, use_case="agreement")
+        increment_usage(session_id, "message_count", 1, use_case="agreement")
         authorities_payload = {"authority_nodes": authorities}
         save_agreement_state(case_id, "authorities", authorities_payload)
         save_agreement_state(case_id, "review", review)
         return {"review": review, "authorities": authorities_payload}
-    ### Youssif added session_id here ###
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id, use_case="agreement")
     return jsonify({"job_id": job_id})
 
 
@@ -1965,9 +2063,7 @@ def agreement_discuss():
     body = request.get_json(force=True)
     case_id = body.get("case_id", "")
     question = body.get("question", "")
-    ### Added by Youssif for Monitoring Purposes ###
     session_id = body.get("session_id")
-    ### END ###
     job_id = _new_job()
 
     def task():
@@ -1980,13 +2076,9 @@ def agreement_discuss():
             stored.get("review") or {},
             authority_nodes,
         )
-        ### Added by Youssif for Monitoring Purposes ###
-        increment_usage(session_id, "llm_request_count",1)
-        increment_usage(session_id, "message_count",1)
-        ### END ###
+        increment_usage(session_id, "llm_request_count", 1, use_case="agreement")
+        increment_usage(session_id, "message_count", 1, use_case="agreement")
         return {"answer": answer}
-    ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+
+    _run_async(job_id, task, session_id=session_id, use_case="agreement")
     return jsonify({"job_id": job_id})
-
-
