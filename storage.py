@@ -1,14 +1,14 @@
-from __future__ import annotations
-
 import threading
+import time
 from typing import Iterable
 
 import dataiku
 import pandas as pd
 
-
 _WRITE_LOCK = threading.RLock()
-
+_CACHE_LOCK = threading.RLock()
+_DATASET_CACHE = {}
+_CACHE_TTL_SECONDS = 10.0  # Keep data in memory for 10 seconds to absorb redundant calls
 
 def _clean_frame(
     dataframe: pd.DataFrame,
@@ -26,45 +26,46 @@ def _clean_frame(
     return result
 
 
-def read_dataset(
-    dataset_name: str,
-) -> pd.DataFrame:
-    try:
-        return dataiku.Dataset(
-            dataset_name,
-            ignore_flow=True,
-        ).get_dataframe()
+def read_dataset(dataset_name: str) -> pd.DataFrame:
+    with _CACHE_LOCK:
+        # 1. Return from memory if we fetched this exact dataset within the last 10 seconds
+        cached = _DATASET_CACHE.get(dataset_name)
+        if cached and (time.time() - cached["timestamp"] < _CACHE_TTL_SECONDS):
+            return cached["df"].copy()
 
-    except Exception:
-        return pd.DataFrame()
+        # 2. Otherwise, fetch it from Dataiku
+        try:
+            df = dataiku.Dataset(
+                dataset_name,
+                ignore_flow=True,
+            ).get_dataframe()
+            
+            # Save it to memory for the next rapid-fire request
+            _DATASET_CACHE[dataset_name] = {"df": df, "timestamp": time.time()}
+            return df.copy()
+
+        except Exception:
+            return pd.DataFrame()
 
 
-def append_rows(
-    dataset_name: str,
-    rows: Iterable[dict],
-) -> int:
+def append_rows(dataset_name: str, rows: Iterable[dict]) -> int:
     rows = list(rows)
-
     if not rows:
         return 0
 
-    dataframe = _clean_frame(
-        pd.DataFrame(rows)
-    )
+    dataframe = _clean_frame(pd.DataFrame(rows))
 
     with _WRITE_LOCK:
         dataset = dataiku.Dataset(
             dataset_name,
             ignore_flow=True,
         )
-
-        dataset.spec_item[
-            "appendMode"
-        ] = True
-
-        dataset.write_with_schema(
-            dataframe
-        )
+        dataset.spec_item["appendMode"] = True
+        dataset.write_with_schema(dataframe)
+        
+        # WIPE THE CACHE for this specific dataset so the next read gets the new rows
+        with _CACHE_LOCK:
+            _DATASET_CACHE.pop(dataset_name, None)
 
     return len(dataframe)
 
@@ -116,7 +117,3 @@ def list_cases() -> pd.DataFrame:
         "case_id",
         keep="last",
     )
-
-
-
-
