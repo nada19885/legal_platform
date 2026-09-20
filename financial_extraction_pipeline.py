@@ -1,7 +1,10 @@
 
 """
-Pure VLM Multi-DPI Pipeline Orchestrator.
+Financial Evidence-Extraction Pipeline Orchestrator.
 Location: lib/python/legal_platform/financial_extraction_pipeline.py
+
+Per page: Stage 1a (PyMuPDF structural evidence) + Stage 1b (single VLM
+visual evidence) -> Stage 2 (text-LLM reconstruction into rows).
 """
 
 from __future__ import annotations
@@ -10,17 +13,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 from typing import Callable, Optional
-from .storage import case_rows 
+from .storage import case_rows
 
-from .config import FINANCIAL_PAGE_MAX_WORKERS, FINANCIAL_LINE_ITEMS_DATASET  
-from .financial_llm_extraction import extract_page_line_items_multi
+from .config import FINANCIAL_PAGE_MAX_WORKERS, FINANCIAL_LINE_ITEMS_DATASET
+from .financial_structural_extraction import extract_page_structure
+from .financial_llm_extraction import extract_page_visual_evidence
 from .financial_page_sources import (
     FinancialPageSource,
     load_document_pdf_bytes,
     load_financial_pages,
     load_page_image_bytes,
 )
-from .financial_reconciliation import persist_reconciled_rows, reconcile_page
+from .financial_reconciliation import (
+    build_rows_from_reconstruction,
+    persist_reconciled_rows,
+    reconstruct_page_transactions,
+)
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -67,30 +75,41 @@ def _process_page(
     failures: list[str] = []
     pdf_bytes = pdf_bytes_by_document.get(page.case_document_id)
 
+    # Stage 1a: PyMuPDF structural evidence (native text/tables). Empty but
+    # harmless on a scanned/image-only page.
+    structural_evidence = {"paragraphs": [], "tables": [], "has_text_layer": False}
+    if pdf_bytes:
+        try:
+            structural_evidence = extract_page_structure(pdf_bytes, page.page_number)
+        except Exception as error:
+            failures.append(f"PyMuPDF structural extraction failed: {error!r}")
+
+    # Stage 1b: single VLM visual pass over the rendered page image.
     image_bytes = None
     try:
         image_bytes = load_page_image_bytes(page)
-        # 3 independent VLM passes (150, 200, 300 DPI)
-        llm_passes, vlm_failures = extract_page_line_items_multi(
-            image_bytes,
-            page.page_image_mime_type,
-            page.page_number,
-            pdf_bytes=pdf_bytes,
-            pass_count=3,
-        )
-        failures.extend(vlm_failures)
     except Exception as error:
-        llm_passes = []
-        failures.append(f"VLM Multi-DPI extraction failed: {error!r}")
+        failures.append(f"Page image load failed: {error!r}")
 
-    # Reconcile: 2 agrees = verified. 3 differ = VLM Arbitrator. If arbitrator not sure = user review.
-    rows = reconcile_page(
-        page.page_id,
-        page.case_document_id,
+    visual_evidence, vlm_failures = extract_page_visual_evidence(
+        image_bytes,
+        page.page_image_mime_type,
         page.page_number,
-        llm_passes,
-        image_bytes=image_bytes,
-        mime_type=page.page_image_mime_type,
+        pdf_bytes=pdf_bytes,
+    )
+    failures.extend(vlm_failures)
+
+    # Stage 2: text-LLM reconstruction cross-checking both evidence sources.
+    try:
+        reconstruction = reconstruct_page_transactions(
+            structural_evidence, visual_evidence, page.page_number,
+        )
+    except Exception as error:
+        failures.append(f"Stage 2 reconstruction failed: {error!r}")
+        reconstruction = {"transactions": []}
+
+    rows = build_rows_from_reconstruction(
+        page.page_id, page.case_document_id, page.page_number, reconstruction,
     )
 
     cleaned_rows = sanitize_extracted_line_items(rows)
@@ -127,7 +146,6 @@ def run_financial_extraction(
             "rows_persisted": 0,
             "verified": sum(1 for r in existing if r.get("row_status") == "verified"),
             "needs_review": sum(1 for r in existing if r.get("row_status") == "needs_review"),
-            "single_source_low_confidence": sum(1 for r in existing if r.get("row_status") == "single_source_low_confidence"),
             "page_failures": [],
             "new_rows_appended": 0,
         }
@@ -170,7 +188,6 @@ def run_financial_extraction(
     persisted_count = persist_reconciled_rows(case_id, all_rows)
     verified_count = sum(1 for r in all_rows if r.get("row_status") == "verified")
     needs_review_count = sum(1 for r in all_rows if r.get("row_status") == "needs_review")
-    low_conf_count = sum(1 for r in all_rows if r.get("row_status") == "single_source_low_confidence")
 
     return {
         "case_id": case_id,
@@ -178,7 +195,6 @@ def run_financial_extraction(
         "rows_persisted": persisted_count if isinstance(persisted_count, int) else len(all_rows),
         "verified": verified_count,
         "needs_review": needs_review_count,
-        "single_source_low_confidence": low_conf_count,
         "page_failures": page_failures,
         "new_rows_appended": len(all_rows),
     }
