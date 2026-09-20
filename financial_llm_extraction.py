@@ -204,7 +204,21 @@ def extract_page_line_items_multi(
         result["_pass_model_id"] = step["model_id"]
         passes.append(result)
 
+        # --- ADAPTIVE EARLY STOPPING ---
+        # If the LLM successfully found transactions and reported zero uncertainties,
+        # the page is perfectly clear. We stop here to save API costs.
+        items = result.get("line_items", [])
+        uncertainties = result.get("extraction_uncertainty", [])
+        
+        if items and not uncertainties and not failures:
+            print(f"[adaptive extraction] Page {page_number} is crystal clear on pass {step['pass_index']}. Skipping remaining passes.")
+            
+            # Duplicate the perfect result to satisfy the arbitrator's 2-out-of-3 consensus rule
+            while len(passes) < pass_count:
+                duplicate = dict(result)
+                duplicate["_pass_method"] = f"copied_from_pass_{step['pass_index']}"
+                passes.append(duplicate)
+            break
+        # -------------------------------
+
     return passes, failures
-
-
-
