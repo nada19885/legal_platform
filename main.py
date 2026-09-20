@@ -69,7 +69,7 @@ from legal_platform.config import (
     FINANCIAL_LINE_ITEMS_DATASET,
     FINANCIAL_TIMELINE_DATASET,
 )
-from legal_platform.financial_classification import classify_case_documents
+from legal_platform.financial_classification import classify_case_pages
 from legal_platform.financial_corrections import (
     list_rows_needing_review,
     load_latest_corrections,
@@ -1286,7 +1286,7 @@ def documents_review_completeness():
 # Accounting & forensic dispute analysis
 #
 # Same pipeline as the Streamlit "Accounting analysis" tab:
-#   1. classify_case_documents        (Stage 2 — optional, manual trigger)
+#   1. classify_case_pages            (Stage 2 — optional, manual trigger)
 #   2. run_financial_extraction       (Stage 3 — dual-resolution OCR + reconcile)
 #   3. submit_correction              (manual conflict resolution)
 #   4. normalize_row_for_ledger       (per-row, done on every /case read)
@@ -1306,16 +1306,15 @@ def accounting_classify_documents():
 
     def task():
         data = load_case_data(case_id)
-        doc_ids = (
-            data["documents"]["case_document_id"].dropna().astype(str).tolist()
-            if not data["documents"].empty else []
-        )
-        _set_progress(job_id, stage="classify", detail="Classifying financial documents…")
-        classify_case_documents(case_id, doc_ids)
+        pages = data["pages"]
+        id_col = "case_document_page_id" if "case_document_page_id" in pages.columns else "page_id"
+        page_ids = pages[id_col].dropna().astype(str).tolist() if not pages.empty else []
+        _set_progress(job_id, stage="classify", detail="Classifying financial pages…")
+        classify_case_pages(case_id, page_ids)
         ### Added by Youssif for Monitoring Purposes ###
         increment_usage(session_id, "llm_request_count", 1)
         ### END ###
-        return {"classified_documents": len(doc_ids)}
+        return {"classified_pages": len(page_ids)}
     ### Youssif added session_id here ##
     _run_async(job_id, task, case_id=case_id, session_id=session_id)
     return jsonify({"job_id": job_id})
