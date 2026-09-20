@@ -186,11 +186,105 @@ def run_claim_based_accounting_analysis(case_id: str, normalized_ledger: list[di
         logger.warning(f"Accounting analysis failed: {err!r}")
         findings_result = {"claim_evaluations": []}
 
-    _persist_claim_results(case_id, findings_result)
+    _persist_forensic_results(case_id, findings_result)
     return findings_result
 
 
-def _persist_claim_results(case_id: str, results: dict):
+# -----------------------------------------------------------------------------
+# DISCREPANCY / NUMBERS-AGREEMENT SYNTHESIS (no customer claims required)
+# -----------------------------------------------------------------------------
+DISCREPANCY_AND_FINDINGS_PROMPT = r"""
+You are the Chief Forensic Auditor for Banque Saudi Fransi (BSF), cross-checking
+the bank's own extracted financial ledger for internal numeric consistency and
+preparing the forensic accounting findings that will support the bank's
+written pleading.
+
+FINANCIAL LEDGER (all extracted transactions, chronological):
+{ledger_json}
+
+TASKS:
+1. Cross-check the numbers: total inflows, total transfers to the bank, any
+   disputed freeze/hold amount, and whether the ledger is internally
+   consistent (debits, credits and running balances agree with each other,
+   no unexplained gaps).
+2. Identify and categorize any discrepancies (e.g. bank_error,
+   ocr_extraction_issue, customer_misstatement, missing_evidence, rounding,
+   other), each with a clear explanation and the ledger record(s) it draws on.
+3. Write the forensic accounting findings summary supporting the bank's defence.
+
+RULES:
+- Use ONLY the transactions given. Never invent amounts, dates or references.
+- Every discrepancy must cite the record(s) (date/description/amount) it is
+   based on in "evidence_support".
+- Provide the executive summary in BOTH Arabic and English.
+- If the ledger is too small or too clean to raise any discrepancy, return an
+   empty "discrepancies" list rather than inventing one.
+
+RETURN JSON ONLY:
+{
+  "cross_check_summary": {
+    "numbers_agree_overall": true,
+    "total_inflows": "...",
+    "total_transfers_to_bank": "...",
+    "disputed_freeze_amount": "...",
+    "primary_discrepancy_narrative": "..."
+  },
+  "discrepancies": [
+    {
+      "issue_title": "...",
+      "category": "...",
+      "analysis": "...",
+      "evidence_support": "...",
+      "source_quote": "..."
+    }
+  ],
+  "accounting_findings": {
+    "executive_summary_en": "...",
+    "executive_summary_ar": "...",
+    "bank_financial_posture": "...",
+    "recommended_legal_arguments": ["..."]
+  }
+}
+""".strip()
+
+
+def run_discrepancy_and_findings_analysis(case_id: str, normalized_ledger: list[dict]) -> dict:
+    """Case-wide numbers-agreement cross-check over the normalized ledger —
+    no customer claims involved, unlike run_claim_based_accounting_analysis.
+    Persists cross_check_summary / discrepancies / accounting_findings so
+    load_saved_forensic_results can serve them back to /case and /accounting/synthesize.
+    """
+    if not normalized_ledger:
+        raise ValueError("No normalized transactions available for forensic analysis.")
+
+    compact_ledger = [
+        {
+            "page_number": r.get("page_number"),
+            "date": r.get("date"),
+            "type": r.get("debit_or_credit"),
+            "amount": r.get("amount"),
+            "currency": r.get("currency"),
+            "description": str(r.get("description", ""))[:120],
+        }
+        for r in normalized_ledger
+    ]
+
+    prompt = DISCREPANCY_AND_FINDINGS_PROMPT.replace(
+        "{ledger_json}", json.dumps(compact_ledger, ensure_ascii=False)
+    )
+
+    try:
+        print("[forensic synthesis] Cross-checking ledger numbers and building findings...", flush=True)
+        result = _call_text_llm(prompt)
+    except Exception as err:
+        logger.warning(f"Discrepancy/findings analysis failed: {err!r}")
+        result = {"cross_check_summary": {}, "discrepancies": [], "accounting_findings": {}}
+
+    _persist_forensic_results(case_id, result)
+    return result
+
+
+def _persist_forensic_results(case_id: str, results: dict):
     row = {
         "finding_id": random_id("FIND"),
         "case_id": str(case_id),
@@ -215,6 +309,9 @@ def load_saved_forensic_results(case_id: str) -> dict:
     out = {
         "timeline": [],
         "claim_evaluations": [],
+        "discrepancies": [],
+        "cross_check_summary": {},
+        "accounting_findings": {},
     }
     try:
         ds_t = dataiku.Dataset(FINANCIAL_TIMELINE_DATASET)
@@ -233,6 +330,9 @@ def load_saved_forensic_results(case_id: str) -> dict:
                 latest = matches.iloc[-1].to_dict()
                 parsed_findings = json.loads(latest.get("accounting_findings_json", "{}") or "{}")
                 out["claim_evaluations"] = parsed_findings.get("claim_evaluations", [])
+                out["discrepancies"] = parsed_findings.get("discrepancies", [])
+                out["cross_check_summary"] = parsed_findings.get("cross_check_summary", {})
+                out["accounting_findings"] = parsed_findings.get("accounting_findings", {})
     except Exception:
         pass
 
