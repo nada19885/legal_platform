@@ -450,5 +450,5 @@ def run_defence_plan(case_record, analysis, facts, evidence, authority_nodes):
     )
 
 
-def run_accounting_classification(case_id: str, case_document_ids: list[str], actor: str = ""):
-    return classify_case_documents(case_id, case_document_ids, actor=actor)
+def run_accounting_classification(case_id: str, page_ids: list[str], actor: str = ""):
+    return classify_case_pages(case_id, page_ids, actor=actor)

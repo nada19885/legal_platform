@@ -6,7 +6,7 @@ Location: lib/python/legal_platform/financial_workbench.py
 
 from __future__ import annotations
 
-from .financial_classification import classify_case_documents
+from .financial_classification import classify_case_pages
 from .financial_extraction_pipeline import run_financial_extraction
 from .financial_forensics import (
     build_full_normalized_ledger,
@@ -18,23 +18,23 @@ from .financial_corrections import list_rows_needing_review
 
 def run_accounting_analysis(
     case_id: str,
-    case_document_ids: list[str],
+    page_ids: list[str],
     actor: str = "",
     force_rerun: bool = False,
 ) -> dict:
     """
-    1. Classify only documents not yet classified (unless force_rerun).
+    1. Classify only pages not yet classified (unless force_rerun).
     2. Extract only pages not yet extracted (unless force_rerun).
     3. If step 2 appended any new rows, rebuild the full ledger and
        rerun the case-wide forensic synthesis. Otherwise, load what's
        already saved — zero LLM calls.
     """
-    classifications = classify_case_documents(
-        case_id, case_document_ids, actor=actor, force_rerun=force_rerun,
+    classifications = classify_case_pages(
+        case_id, page_ids, actor=actor, force_rerun=force_rerun,
     )
 
     extraction_result = run_financial_extraction(
-        case_id, case_document_ids, actor=actor, force_rerun=force_rerun,
+        case_id, page_ids, actor=actor, force_rerun=force_rerun,
     )
 
     new_rows = extraction_result.get("new_rows_appended", 0)

@@ -174,7 +174,7 @@ def classify_case_pages(case_id: str, page_ids: list[str], actor: str = "", forc
         except Exception:
             pass # Dataset was empty or didn't exist yet
         ds.write_with_schema(df) # Automatically updates schema with our new columns!
-        
+
     return results
 
 

@@ -1397,9 +1397,19 @@ def documents_review_completeness():
     return _ok({"reply": result["reply"], "interview_state": result["decision"].payload})
 
 
-# =============================================================================
-# ACCOUNTING & FORENSIC DISPUTE ANALYSIS ENDPOINTS
-# =============================================================================
+# ============================================================
+# Accounting & forensic dispute analysis
+#
+# Same pipeline as the Streamlit "Accounting analysis" tab:
+#   1. classify_case_pages            (Stage 2 — optional, manual trigger)
+#   2. run_financial_extraction       (Stage 3 — dual-resolution OCR + reconcile)
+#   3. submit_correction              (manual conflict resolution)
+#   4. normalize_row_for_ledger       (per-row, done on every /case read)
+#   5. build_and_save_financial_timeline + run_discrepancy_and_findings_analysis
+# The normalized ledger, conflicts, timeline and findings are all
+# returned as part of /case (see case_endpoint) so the tab renders from
+# the same snapshot as everything else; these routes only perform writes.
+# ============================================================
 @app.route("/accounting/classify_documents", methods=["POST"])
 def accounting_classify_documents():
     body = request.get_json(force=True)
@@ -1409,64 +1419,17 @@ def accounting_classify_documents():
 
     def task():
         data = load_case_data(case_id)
-        
-        page_ids = []
-        if not data["pages"].empty:
-            id_col = "case_document_page_id" if "case_document_page_id" in data["pages"].columns else "page_id"
-            page_ids = data["pages"][id_col].dropna().astype(str).tolist()
-
-        _set_progress(job_id, stage="classify", detail="Classifying pages for claims and financial data…")
+        pages = data["pages"]
+        id_col = "case_document_page_id" if "case_document_page_id" in pages.columns else "page_id"
+        page_ids = pages[id_col].dropna().astype(str).tolist() if not pages.empty else []
+        _set_progress(job_id, stage="classify", detail="Classifying financial pages…")
         classify_case_pages(case_id, page_ids)
-        
-        if session_id:
-            increment_usage(session_id, "llm_request_count", 1)
-
-        refreshed = load_case_data(case_id)
-        state = restore_workflow_state(refreshed)
-        state["accounting_status"] = "classified"
-        persist_workflow_state(state, refreshed, case_id, action="accounting_classified")
-
+        ### Added by Youssif for Monitoring Purposes ###
+        increment_usage(session_id, "llm_request_count", 1)
+        ### END ###
         return {"classified_pages": len(page_ids)}
-
-    _run_async(job_id, task, session_id=session_id)
-    return jsonify({"job_id": job_id})
-
-
-@app.route("/accounting/extract", methods=["POST"])
-def accounting_extract():
-    body = request.get_json(force=True)
-    case_id = body.get("case_id", "")
-    page_ids = [str(d) for d in (body.get("page_ids") or body.get("document_ids") or [])] # Handle both keys just in case
-    session_id = body.get("session_id")
-    
-    if not page_ids:
-        return jsonify({"error": "Select at least one page."}), 400
-    job_id = _new_job()
-
-    def task():
-        data = load_case_data(case_id)
-        def _on_progress(current, total, page_id):
-            _set_progress(
-                job_id, stage="extraction", current=current, total=total,
-                detail=f"3-DPI VLM Extraction: page {current} of {total}…" if total else "Extracting…",
-            )
-        _set_progress(job_id, stage="extraction", detail="Executing 3-pass visual extraction with VLM Arbitrator…")
-        
-        result = run_financial_extraction(case_id, page_ids, progress_callback=_on_progress)
-        
-        if session_id:
-            increment_usage(session_id, "llm_request_count", 1)
-
-        refreshed = load_case_data(case_id)
-        state = restore_workflow_state(refreshed)
-        pending = _serialise_conflicts(case_id, refreshed.get("pages"))
-        state["accounting_status"] = "needs_review" if pending else "ready_for_synthesis"
-        persist_workflow_state(state, refreshed, case_id, action="accounting_extracted")
-
-        rows_persisted = result.get("rows_persisted", 0) if isinstance(result, dict) else 0
-        return {"rows_persisted": rows_persisted}
-
-    _run_async(job_id, task, session_id=session_id)
+    ### Youssif added session_id here ##
+    _run_async(job_id, task, case_id=case_id, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
