@@ -20,6 +20,16 @@ const I18N = {
     "accounting_analysis": "Accounting & forensic dispute analysis",
     "accounting_analysis_caption": "Reconcile account line items, build chronologies, detect number discrepancies, and synthesize forensic court findings.",
     "accounting_data_cleared": "Case accounting records cleared.",
+    "accounting_instructions_label": "Analysis instructions (optional)",
+    "accounting_instructions_placeholder": "e.g. Focus only on the disputed wire transfers; treat POS purchases as undisputed.",
+    "accounting_response_label": "Accounting response",
+    "financial_question_label": "Financial question",
+    "claim_result_supported": "Supported",
+    "claim_result_partially_supported": "Partially supported",
+    "claim_result_contradicted": "Contradicted by evidence",
+    "claim_result_not_verifiable": "Not verifiable",
+    "claim_result_no_financial_evidence": "No financial evidence",
+    "claim_result_not_financial_claim": "Not a financial claim",
     "all_reconciled": "All extracted transactions are reconciled across sources.",
     "classification_completed": "Document classification complete.",
     "classify_financial_documents": "1. Classify financial documents",
@@ -462,6 +472,16 @@ const I18N = {
     "accounting_analysis": "التحليل المحاسبي والجنائي للنزاع",
     "accounting_analysis_caption": "تسوية بنود الحساب، وبناء التسلسل الزمني، واكتشاف الفروقات في الأرقام، وتوليف النتائج المحاسبية الجنائية للمرافعة.",
     "accounting_data_cleared": "تم مسح سجلات المحاسبة الخاصة بالقضية.",
+    "accounting_instructions_label": "تعليمات التحليل (اختياري)",
+    "accounting_instructions_placeholder": "مثال: ركّز فقط على التحويلات البنكية محل النزاع؛ اعتبر مشتريات نقاط البيع غير متنازع عليها.",
+    "accounting_response_label": "الرد المحاسبي",
+    "financial_question_label": "السؤال المالي",
+    "claim_result_supported": "مدعوم",
+    "claim_result_partially_supported": "مدعوم جزئياً",
+    "claim_result_contradicted": "تناقضه الأدلة",
+    "claim_result_not_verifiable": "غير قابل للتحقق",
+    "claim_result_no_financial_evidence": "لا توجد أدلة مالية",
+    "claim_result_not_financial_claim": "ليس مطلباً مالياً",
     "all_reconciled": "تمت تسوية جميع المعاملات المستخرجة عبر المصادر.",
     "classification_completed": "اكتمل تصنيف المستندات.",
     "classify_financial_documents": "١. تصنيف المستندات المالية",
@@ -1018,6 +1038,7 @@ function applyLanguage() {
   setPlaceholder('[data-form="confirm-classification"] textarea[name="review_objective"]',
     "review_objective_placeholder");
   setPlaceholder('[data-form="create-case"] input[name="case_name"]', "enter_clear_file_name");
+  setPlaceholder("#accounting-instructions", "accounting_instructions_placeholder");
 }
 
 function setPlaceholder(selector, key) {
@@ -1901,26 +1922,34 @@ function renderAccountingDiscrepancies(discrepancies) {
       </div>`).join("")}`);
 }
 
+const CLAIM_RESULT_BADGE_KIND = {
+  SUPPORTED: "flagged",
+  PARTIALLY_SUPPORTED: "review",
+  CONTRADICTED: "verified",
+  NOT_VERIFIABLE: "review",
+  NO_FINANCIAL_EVIDENCE: "neutral",
+  NOT_FINANCIAL_CLAIM: "neutral",
+};
+
 function renderAccountingFindings(findings) {
   const target = region("accounting-findings");
   if (!target) return;
-  if (!findings || !Object.keys(findings).length) { html(target, ""); return; }
-  const summaryText = isRTL()
-    ? (findings.executive_summary_ar || findings.executive_summary_en || "")
-    : (findings.executive_summary_en || findings.executive_summary_ar || "");
+  const evaluations = (findings && findings.claim_evaluations) || [];
+  if (!evaluations.length) { html(target, ""); return; }
+
   html(target, `
     <h4 class="bsf-subsection">${esc(t("findings_heading"))}</h4>
-    ${summaryText ? (isRTL()
-      ? `<div class="bilingual-panel arabic-block" dir="rtl">${esc(summaryText)}</div>`
-      : `<div class="bilingual-panel english-block">${esc(summaryText)}</div>`) : ""}
-    <details class="bsf-expander">
-      <summary>${esc(t("recommended_defense_posture"))}</summary>
-      <div class="bsf-expander-body">
-        <div class="bsf-kv"><strong>${esc(t("recommended_defense_posture"))}:</strong> ${esc(findings.bank_financial_posture || "")}</div>
-        <div class="bsf-kv"><strong>${esc(t("key_arguments_for_court"))}:</strong></div>
-        <ul>${(findings.recommended_legal_arguments || []).map((arg) => `<li>${esc(arg)}</li>`).join("")}</ul>
-      </div>
-    </details>`);
+    ${evaluations.map((item) => `
+      <div class="bsf-item">
+        <div class="bsf-item-controls" style="justify-content:space-between; margin-top:0;">
+          <strong>${esc(item.claim || "")}</strong>
+          ${badge(t(`claim_result_${String(item.result || "").toLowerCase()}`), CLAIM_RESULT_BADGE_KIND[item.result] || "neutral")}
+        </div>
+        ${item.financial_question ? `<div class="bsf-kv"><strong>${esc(t("financial_question_label"))}:</strong> ${esc(item.financial_question)}</div>` : ""}
+        ${item.comparison ? `<div class="bsf-kv">${esc(item.comparison)}</div>` : ""}
+        ${item.accounting_response ? `<div class="bsf-kv"><strong>${esc(t("accounting_response_label"))}:</strong> ${esc(item.accounting_response)}</div>` : ""}
+        ${item.limitation ? `<p class="bsf-caption">${esc(item.limitation)}</p>` : ""}
+      </div>`).join("")}`);
 }
 
 /* ============================================================
@@ -2955,8 +2984,12 @@ const ACTIONS = {
   },
 
   "accounting-synthesize": async () => {
+    const instructions = ($("#accounting-instructions") || {}).value || "";
     try {
-      await runJob(apiPost("/accounting/synthesize", { case_id: S.caseId }), "accounting-synthesize-job");
+      await runJob(
+        apiPost("/accounting/synthesize", { case_id: S.caseId, instructions }),
+        "accounting-synthesize-job",
+      );
       await refreshCase();
     } catch (error) {
       html(region("accounting-findings"), alertBox(error.message || String(error), "flag"));
