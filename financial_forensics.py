@@ -46,19 +46,32 @@ INPUTS:
 - User Analysis Instructions: {instructions}
 
 METHODOLOGY:
-1. Understand the claim to determine the exact financial question.
-2. Determine what financial evidence would normally be expected.
-3. Identify the relevant financial evidence from the provided ledger.
-4. Compare the claim against the evidence.
-5. Apply any provided user instructions strictly as methodological guidance.
+1. Understand each customer claim and determine the exact financial question that needs to be investigated.
+2. Read the User Analysis Instructions and use them to determine the requested accounting focus, scope, or methodology.
+3. Determine what financial evidence would normally be expected to answer the claim and the requested analysis.
+4. Identify the relevant financial evidence from the provided ledger.
+5. Perform the requested accounting analysis using the available evidence.
+6. Compare the claim against the financial evidence.
+7. Clearly identify any discrepancies, missing evidence, unexplained amounts, inconsistencies, or limitations.
+
+HOW TO USE THE USER ANALYSIS INSTRUCTIONS:
+- Treat the user's instructions as guidance for what should be investigated.
+- The instructions may specify a period, transaction type, amount, calculation, reconciliation, discrepancy, or accounting question to focus on.
+- The instructions guide the scope and methodology of the accounting analysis.
+- The instructions MUST NOT determine the conclusion.
+- Do not assume that a hypothesis stated by the user is true.
+- Verify the requested issue independently using the provided financial evidence.
+- Do not ignore evidence that contradicts the user's requested hypothesis.
+- If the evidence does not support the user's requested hypothesis, state that clearly.
+- If no user instructions are provided, perform the normal claim-based accounting analysis.
 
 RULES:
-- Use ONLY the provided claims and ledger.
-- Never invent transactions, amounts, dates, or references.
-- Do not make legal conclusions (e.g., liability, regulatory violations).
-- State limitations if the ledger cannot fully answer the allegation (e.g., authorization).
+- Use ONLY the provided claims and financial evidence.
+- Never invent transactions, amounts, dates, references, calculations, or supporting evidence.
+- Every accounting conclusion must be supported by the available financial evidence.
+- Do not make legal conclusions such as liability, regulatory violations, or legal entitlement.
+- Clearly state limitations when the available ledger cannot fully answer the accounting question.
 - Result must be one of: SUPPORTED, PARTIALLY_SUPPORTED, CONTRADICTED, NOT_VERIFIABLE, NO_FINANCIAL_EVIDENCE, NOT_FINANCIAL_CLAIM.
-
 RETURN JSON ONLY:
 {
   "claim_evaluations": [
@@ -337,5 +350,4 @@ def load_saved_forensic_results(case_id: str) -> dict:
         pass
 
     return out
-
 
