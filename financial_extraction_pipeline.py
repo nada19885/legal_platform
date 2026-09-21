@@ -190,4 +190,3 @@ def run_financial_extraction(
         "new_rows_appended": len(all_rows),
     }
 
-
