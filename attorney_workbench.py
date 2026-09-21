@@ -106,42 +106,116 @@ def _compact_strategy(value: Any) -> Any:
 
 
 def _compact_forensic_data(case_data: dict | None) -> dict:
-    """Extracts and bounds the reconciled financial ledger, discrepancies, and findings."""
+    """
+    Extract and bound the financial timeline and the new
+    claim-based accounting analysis for pleading generation.
+    """
     source = case_data if isinstance(case_data, dict) else {}
 
+    # ---------------------------------------------------------
+    # Financial timeline
+    # ---------------------------------------------------------
     raw_timeline = _records(source.get("financial_timeline", []))
+
     compact_timeline = []
+
     for row in raw_timeline[:35]:
         compact_timeline.append({
+            "record_id": str(
+                row.get("row_id", "")
+                or row.get("timeline_id", "")
+            ),
             "date": str(row.get("date", "—")),
             "page": str(row.get("page_number", "")),
             "amount": f"{row.get('amount', '—')} {row.get('currency', 'SAR')}",
             "type": str(row.get("debit_or_credit", "unclear")),
-            "description": _compact(row.get("description", ""), 300),
+            "description": _compact(
+                row.get("description", ""),
+                300,
+            ),
             "status": str(row.get("row_status", "")),
         })
 
-    raw_discrepancies = _records(source.get("discrepancies", []))
-    compact_discrepancies = []
-    for d in raw_discrepancies[:12]:
-        compact_discrepancies.append({
-            "category": str(d.get("category", "")),
-            "issue": _compact(d.get("issue_title", ""), 250),
-            "variance": str(d.get("amount_difference", "")),
-            "analysis": _compact(d.get("analysis", ""), 600),
-            "citation": _compact(d.get("evidence_support", ""), 200),
-            "quote": _compact(d.get("source_quote", ""), 200),
-        })
-
+    # ---------------------------------------------------------
+    # Claim-based accounting analysis
+    # ---------------------------------------------------------
     findings = source.get("forensic_findings") or {}
-    summary = source.get("cross_check_summary") or {}
+
+    raw_claim_evaluations = _records(
+        findings.get("claim_evaluations", [])
+    )
+
+    compact_claim_evaluations = []
+
+    for evaluation in raw_claim_evaluations[:15]:
+
+        evidence_found = []
+
+        for evidence in _records(
+            evaluation.get("financial_evidence_found", [])
+        )[:15]:
+            evidence_found.append({
+                "record_id": str(
+                    evidence.get("record_id", "")
+                ),
+                "date": str(
+                    evidence.get("date", "")
+                ),
+                "type": str(
+                    evidence.get("type", "")
+                ),
+                "amount": evidence.get("amount"),
+                "reference": _compact(
+                    evidence.get("reference", ""),
+                    200,
+                ),
+            })
+
+        compact_claim_evaluations.append({
+            "claim_id": str(
+                evaluation.get("claim_id", "")
+            ),
+            "claim": _compact(
+                evaluation.get("claim", ""),
+                1200,
+            ),
+            "financial_question": _compact(
+                evaluation.get("financial_question", ""),
+                1000,
+            ),
+            "expected_evidence": _compact(
+                evaluation.get("expected_evidence", ""),
+                1000,
+            ),
+            "financial_evidence_found": evidence_found,
+            "comparison": _compact(
+                evaluation.get("comparison", ""),
+                1500,
+            ),
+            "result": str(
+                evaluation.get("result", "")
+            ),
+            "accounting_response": _compact(
+                evaluation.get("accounting_response", ""),
+                1800,
+            ),
+            "limitation": _compact(
+                evaluation.get("limitation", ""),
+                1000,
+            ),
+            "evidence_record_ids": (
+                evaluation.get("evidence_record_ids", [])[:20]
+                if isinstance(
+                    evaluation.get("evidence_record_ids"),
+                    list,
+                )
+                else []
+            ),
+        })
 
     return {
         "reconciled_financial_timeline": compact_timeline,
-        "cross_check_summary": summary,
-        "detected_discrepancies": compact_discrepancies,
-        "forensic_accounting_posture": _compact(findings.get("bank_financial_posture", ""), 1500),
-        "recommended_accounting_arguments": findings.get("recommended_legal_arguments", [])[:6],
+        "claim_evaluations": compact_claim_evaluations,
     }
 
 
@@ -239,12 +313,43 @@ identified as a conditional settlement option approved by BSF's attorney. In
 particular, do not request release of frozen funds, compensation to the customer,
 or acceptance of the opponent's allegations as BSF's primary relief.
 
-FORENSIC ACCOUNTING INTEGRATION
-Use the supplied `forensic_financial_analysis` to:
-- Establish the exact audited monetary chronology and cash movements.
-- Explicitly argue the mathematical findings (e.g. reconciling the Binance P2P sale amount versus the STC Pay transfer and the actual frozen amount).
-- Highlight categorized discrepancies and evidence quotes to challenge unsupported claims or evidentiary gaps from the opposing party.
-- Demonstrate that BSF's administrative actions (such as account restrictions or freeze procedures) complied strictly with regulatory mandates and verified fraud notices.
+LEGAL AND ACCOUNTING ANALYSIS INTEGRATION
+
+The legal analysis and the accounting analysis are two independent analytical
+inputs. Use both when preparing the written pleading.
+
+LEGAL ANALYSIS:
+Use the supplied `legal_analysis` for legal issues, legal reasoning, defences,
+and conclusions supported by the retrieved legal authorities.
+
+ACCOUNTING ANALYSIS:
+Use the supplied `forensic_financial_analysis` for financial facts and
+claim-based accounting findings.
+
+The accounting analysis contains:
+- the reconciled financial timeline; and
+- `claim_evaluations`, where each customer claim has been independently
+  evaluated against the available financial evidence.
+
+For each relevant claim evaluation:
+- understand the customer's claim;
+- use the identified financial question;
+- use the financial evidence found;
+- use the accounting comparison;
+- accurately reflect the accounting result;
+- incorporate the accounting response where relevant to BSF's factual position;
+- preserve any stated limitations or missing evidence.
+
+IMPORTANT:
+- Do not treat accounting findings as legal conclusions.
+- Do not create a legal proposition from an accounting finding unless it is
+  supported by the supplied legal analysis and legal authorities.
+- Do not change the result of an accounting evaluation.
+- Do not omit contradictory financial evidence.
+- If an accounting evaluation is NOT_VERIFIABLE or identifies a limitation,
+  state that accurately rather than presenting the matter as proven.
+- Use accounting evidence to strengthen the factual and monetary portions of
+  the pleading where relevant.
 
 SOURCE RESTRICTION
 Use only:
@@ -267,8 +372,7 @@ The Arabic pleading must:
 - present a concise statement of facts incorporating the audited financial timeline and source pages;
 - separate procedural/formal defences from substantive defences;
 - organise each defence as: heading, supported fact, applicable authority, application, and requested consequence;
-- respond directly and respectfully to each material opposing allegation using the forensic discrepancies;
-- cite retrieved authorities by their title/article/citation and node_id;
+- respond directly and respectfully to each material opposing allegation using the legal analysis and, where financially relevant, the corresponding claim-based accounting evaluation;- cite retrieved authorities by their title/article/citation and node_id;
 - number the final requests clearly;
 - end respectfully with: والله الموفق، وصلى الله وسلم على نبينا محمد;
 - include a signature block for the represented party or attorney.
