@@ -1429,7 +1429,7 @@ def accounting_classify_documents():
         ### END ###
         return {"classified_pages": len(page_ids)}
     ### Youssif added session_id here ##
-    _run_async(job_id, task, case_id=case_id, session_id=session_id)
+    _run_async(job_id, task, session_id=session_id)
     return jsonify({"job_id": job_id})
 
 
@@ -1464,7 +1464,205 @@ def accounting_clear():
 
     return _ok({"cleared": True})
 
+@app.route("/accounting/extract", methods=["POST"])
+def accounting_extract():
+    body = request.get_json(force=True)
 
+    case_id = str(body.get("case_id", "")).strip()
+    document_ids = [
+        str(doc_id).strip()
+        for doc_id in (body.get("document_ids") or [])
+        if str(doc_id).strip()
+    ]
+    session_id = body.get("session_id")
+
+    if not case_id:
+        return jsonify({"error": "case_id is required"}), 400
+
+    if not document_ids:
+        return jsonify({"error": "At least one document must be selected."}), 400
+
+    job_id = _new_job()
+
+    def task():
+        # ---------------------------------------------------------
+        # 1. Load current case
+        # ---------------------------------------------------------
+        data = load_case_data(case_id)
+        pages = data["pages"]
+
+        if pages.empty:
+            raise ValueError("No document pages are available for extraction.")
+
+        page_id_col = (
+            "case_document_page_id"
+            if "case_document_page_id" in pages.columns
+            else "page_id"
+        )
+
+        doc_id_col = (
+            "case_document_id"
+            if "case_document_id" in pages.columns
+            else "document_id"
+        )
+
+        if doc_id_col not in pages.columns:
+            raise ValueError(
+                "Could not identify the document ID column in case pages."
+            )
+
+        # ---------------------------------------------------------
+        # 2. Keep only pages belonging to documents selected by user
+        # ---------------------------------------------------------
+        selected_pages = pages[
+            pages[doc_id_col].astype(str).isin(document_ids)
+        ]
+
+        if selected_pages.empty:
+            raise ValueError(
+                "No pages were found for the selected documents."
+            )
+
+        # ---------------------------------------------------------
+        # 3. From selected documents, extract only
+        #    FINANCIAL or MIXED pages
+        # ---------------------------------------------------------
+        classifications = _latest_classifications_by_page(data)
+
+        financial_page_ids = []
+
+        for _, row in selected_pages.iterrows():
+            page_id = str(row.get(page_id_col, "")).strip()
+
+            if not page_id:
+                continue
+
+            classification = classifications.get(page_id, {})
+            page_type = str(
+                classification.get("page_type", "")
+            ).lower().strip()
+
+            if page_type in {"financial", "mixed"}:
+                financial_page_ids.append(page_id)
+
+        if not financial_page_ids:
+            raise ValueError(
+                "No financial or mixed pages were found "
+                "in the selected documents. Run classification first."
+            )
+
+        # ---------------------------------------------------------
+        # 4. Mark accounting as extracting
+        # ---------------------------------------------------------
+        state = restore_workflow_state(data)
+        state["accounting_status"] = "extracting"
+
+        persist_workflow_state(
+            state,
+            data,
+            case_id,
+            action="accounting_extraction_started",
+        )
+
+        # ---------------------------------------------------------
+        # 5. Run financial extraction
+        # ---------------------------------------------------------
+        def _on_progress(current, total, page_id):
+            _set_progress(
+                job_id,
+                stage="extraction",
+                current=current,
+                total=total,
+                detail=(
+                    f"Extracting financial data "
+                    f"(page {current} of {total})..."
+                ),
+            )
+
+        _set_progress(
+            job_id,
+            stage="extraction",
+            current=0,
+            total=len(financial_page_ids),
+            detail=(
+                f"Extracting financial data from "
+                f"{len(financial_page_ids)} financial pages..."
+            ),
+        )
+
+        result = run_financial_extraction(
+            case_id,
+            financial_page_ids,
+            progress_callback=_on_progress,
+        )
+
+        rows_persisted = (
+            result.get("rows_persisted", 0)
+            if isinstance(result, dict)
+            else 0
+        )
+
+        # ---------------------------------------------------------
+        # 6. Reload persisted results
+        # ---------------------------------------------------------
+        final_data = load_case_data(case_id)
+        state = restore_workflow_state(final_data)
+
+        pending = _serialise_conflicts(
+            case_id,
+            final_data.get("pages"),
+        )
+
+        line_items_df = final_data.get("financial_line_items")
+
+        has_items = (
+            line_items_df is not None
+            and not line_items_df.empty
+        )
+
+        # ---------------------------------------------------------
+        # 7. Decide next accounting stage
+        # ---------------------------------------------------------
+        if pending:
+            state["accounting_status"] = "needs_review"
+
+        elif has_items or rows_persisted > 0:
+            state["accounting_status"] = "ready_for_synthesis"
+
+        else:
+            state["accounting_status"] = "complete_no_transactions"
+
+        state["accounting_dirty"] = False
+        state["accounting_dirty_reason"] = ""
+
+        persist_workflow_state(
+            state,
+            final_data,
+            case_id,
+            action="accounting_extraction_complete",
+        )
+
+        if session_id:
+            increment_usage(
+                session_id,
+                "llm_request_count",
+                1,
+            )
+
+        return {
+            "rows_persisted": rows_persisted,
+            "pages_extracted": len(financial_page_ids),
+            "pending_conflicts": len(pending),
+            "accounting_status": state["accounting_status"],
+        }
+
+    _run_async(
+        job_id,
+        task,
+        session_id=session_id,
+    )
+
+    return jsonify({"job_id": job_id})
 
 
 
@@ -1683,12 +1881,38 @@ def pleading_generate():
     def task():
         data = load_case_data(case_id)
         state = restore_workflow_state(data)
+    
+        # ---------------------------------------------------------
+        # 1. Attorney review must be approved
+        # ---------------------------------------------------------
         if not approval_gate_passed(state):
             raise ValueError(
                 "Prepare the consolidated attorney review first."
                 if not REQUIRE_APPROVED_SUMMARY
                 else "Approve the consolidated attorney review first."
             )
+    
+        # ---------------------------------------------------------
+        # 2. Legal analysis must be completed
+        # ---------------------------------------------------------
+        if not state.get("analysis"):
+            raise ValueError(
+                "Complete the legal analysis before generating the written pleading."
+            )
+    
+        # ---------------------------------------------------------
+        # 3. Accounting analysis must be completed
+        # ---------------------------------------------------------
+        accounting = accounting_state(data, state)
+    
+        if accounting["status"] not in {
+            "forensic_complete",
+            "complete_no_transactions",
+        }:
+            raise ValueError(
+                "Complete the accounting analysis before generating the written pleading."
+            )
+    
         case = data["case"]
         _set_progress(job_id, stage="pleading", detail="Synthesizing bilingual court pleading…")
         instructions = (
