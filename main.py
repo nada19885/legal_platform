@@ -197,11 +197,24 @@ def _build_normalized_ledger(case_id, line_items_df):
     corrections = load_latest_corrections(case_id)
     ledger = []
     for _, row in line_items_df.iterrows():
-        item = normalize_row_for_ledger(row.to_dict(), corrections)
+        row_dict = row.to_dict()
+        
+        # Unpack fields_json so the normalizer can read flat keys (date, amount, etc.)
+        fields_json = row_dict.get("fields_json")
+        if fields_json:
+            try:
+                fields = json.loads(fields_json)
+                if isinstance(fields, dict):
+                    for k, v in fields.items():
+                        if isinstance(v, dict) and "value" in v:
+                            row_dict[k] = v["value"]
+            except Exception:
+                pass
+                
+        item = normalize_row_for_ledger(row_dict, corrections)
         if item is not None:
             ledger.append(item)
     return ledger
-
 
 def _serialise_conflicts(case_id, pages_df=None):
     rows = list_rows_needing_review(case_id) or []
