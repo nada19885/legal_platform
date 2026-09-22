@@ -1,20 +1,6 @@
 """
-Text-LLM Reconstruction Engine — Stage 2 of the financial evidence-
-extraction pipeline.
+Text-LLM Reconstruction Engine — Stage 2 of the financial evidence-extraction pipeline.
 Location: lib/python/legal_platform/financial_reconciliation.py
-
-Takes Stage 1a's PyMuPDF structural evidence and the page's transcription
-text (produced once, at document intake, by the general-purpose OCR VLM
-pass in extraction.py/vlm_adapter.py — not a fresh financial-specific VLM
-call) and asks a text LLM to reconcile them into clean transaction rows,
-with a per-field certainty flag. That intake OCR pass already transcribes
-every page verbatim, including table structure as markdown, at the same
-DPI the financial pipeline would otherwise re-render at — so re-reading the
-page with a second, specialized VLM call would buy no extra precision,
-only cost. This replaces the old 2-of-3 majority-vote + VLM-arbitrator
-design: there is no longer a set of noisy repeats of the same reading to
-vote on, only two independent sources (structural vs. transcribed) to
-cross-check against each other.
 """
 
 from __future__ import annotations
@@ -46,53 +32,32 @@ FIELD_NAMES = (
 )
 
 RECONSTRUCTION_SYSTEM_PROMPT = r"""
-You are a senior forensic accountant reconstructing one page of financial
-evidence in a Saudi banking dispute case involving Banque Saudi Fransi (BSF).
+You are an expert forensic accountant reconciling two independent extractions of a single financial page.
 
-You receive TWO independent readings of the same page:
-- "structural_evidence": machine-extracted native PDF text, tables and
-  headings (PyMuPDF). Exact and reliable wherever it is non-empty, but
-  EMPTY on a scanned/image-only page — an empty value here just means "no
-  structural evidence available", not a contradiction.
-- "transcription_text": a verbatim OCR transcription of the rendered page
-  image (numbers, Arabic and English text, tables rendered as markdown,
-  reading order preserved). This came from a general document-intake pass,
-  not a financial-specialized one — it is complete and verbatim, but not
-  pre-triaged, so it may still contain institutional headers/metadata mixed
-  in with genuine transactions.
+Source A (structural_evidence): Clean native table arrays extracted directly from the PDF code.
+Source B (transcription_text): Verbatim OCR transcription from a visual model.
 
 YOUR TASK:
-1. Reconcile Arabic/English direction and correspondence between the two
-   readings.
-2. Reconstruct every genuine financial transaction row on the page, in
-   printed order, with every column filled in.
-3. For every field, decide whether you are CERTAIN of the value: certain
-   only when the two sources agree, or when a single available source is
-   crisp and unambiguous. Mark uncertain whenever the sources conflict, or
-   the only available reading is blurry/ambiguous/cut off.
-4. Ignore institutional headers/footers (bank paid-up capital, C.R. number,
-   VAT number, P.O. Box, phone, barcodes, legal citations) — only genuine
-   case transactions are rows.
+1. Reconstruct the genuine financial transaction rows.
+2. Rewrite semantic fields (description, transaction type) into clean, professional terms (e.g., 'Financing installment payment no. 5' instead of fragmented OCR). Do not invent new facts.
+3. For exact financial facts (amount, date, reference, balance), PRESERVE THE EXACT NUMBERS.
+4. Determine certainty field-by-field:
+   - If the sources agree or the data is perfectly clear, set `certain: true`.
+   - If the sources conflict (e.g., structural says 12,500 but VLM says 17,500), pick the most likely correct value, set `certain: false`, and explain your reasoning in `reason`.
 
-RULES:
-- Never invent a value neither source supports.
-- "sources.pymupdf" / "sources.transcription" must be the literal text each
-  source reported for that field, or null if that source had nothing for it.
-- If both sources are silent on a field, its value is "" and certain is false.
-
-RETURN JSON ONLY:
+RETURN JSON SCHEMA ONLY:
 {
   "transactions": [
     {
-      "row_index": 0,
-      "date": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "description": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "amount": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "currency": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "debit_or_credit": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "reference_number": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "party_source": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}},
-      "running_balance": {"value": "", "certain": true, "reason": "", "sources": {"pymupdf": null, "transcription": ""}}
+      "row_index": 1,
+      "date": { "value": "", "certain": true, "reason": "" },
+      "description": { "value": "", "certain": true, "reason": "" },
+      "amount": { "value": "", "certain": true, "reason": "" },
+      "currency": { "value": "", "certain": true, "reason": "" },
+      "debit_or_credit": { "value": "debit|credit", "certain": true, "reason": "" },
+      "reference_number": { "value": "", "certain": true, "reason": "" },
+      "party_source": { "value": "", "certain": true, "reason": "" },
+      "running_balance": { "value": "", "certain": true, "reason": "" }
     }
   ]
 }
@@ -104,10 +69,6 @@ def reconstruct_page_transactions(
     transcription_text: str,
     page_number: int,
 ) -> dict:
-    """Stage 2: one text-LLM call reconciling both evidence sources for a
-    single page into structured transactions with a per-field certainty
-    flag. Retries cover only transient request failures.
-    """
     payload = {
         "page_number": page_number,
         "structural_evidence": structural_evidence,
@@ -136,11 +97,6 @@ def build_rows_from_reconstruction(
     page_number: int,
     reconstruction: dict,
 ) -> list[dict]:
-    """Converts Stage 2's transactions into the same row shape the rest of
-    the pipeline (financial_normalizer, financial_corrections, financial_
-    forensics) already expects: fields_json = {field: {value, status,
-    candidates}}, row_status in {verified, needs_review}.
-    """
     rows: list[dict] = []
     for idx, item in enumerate(reconstruction.get("transactions", []) or []):
         resolved_fields = {}
@@ -148,25 +104,24 @@ def build_rows_from_reconstruction(
             info = item.get(field_name) or {}
             value = str(info.get("value", "") or "").strip()
             certain = bool(info.get("certain", False))
-            sources = info.get("sources") or {}
-            candidates = [
-                {"value": str(sources[key]), "source": key}
-                for key in ("pymupdf", "transcription")
-                if sources.get(key)
-            ]
+            reason = str(info.get("reason", "") or "").strip()
 
             if not value:
                 status = "missing"
+                candidates = []
             elif certain:
                 status = "verified"
+                candidates = []
             else:
                 status = "conflict"
+                # ONLY show the AI's suggested value to the user
+                candidates = [{"value": value, "source": "AI Suggested"}]
 
             resolved_fields[field_name] = {
                 "value": value,
                 "status": status,
                 "candidates": candidates,
-                "reason": "" if certain else str(info.get("reason", "") or ""),
+                "reason": reason,
             }
 
         field_statuses = {
